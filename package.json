@@ -1,5 +1,5 @@
 {
   "dependencies": {
-    "caffeinate": "^1.0.1"
+    "python": "^0.0.4"
   }
 }

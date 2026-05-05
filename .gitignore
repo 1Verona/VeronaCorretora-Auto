@@ -1,0 +1,9 @@
+cache/
+.venv/
+__pycache__/
+credentials.json
+*.json
+!package.json
+!package-lock.json
+node_modules/
+.DS_Store
