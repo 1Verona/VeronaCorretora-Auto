@@ -1,0 +1,15 @@
+{
+  "extends": "standard",
+  "env": {
+    "node": true
+  },
+  "parserOptions": {
+    "ecmaVersion": 2017
+  },
+  "rules": {
+    "quotes": [
+      "error",
+      "backtick"
+    ]
+  }
+}
