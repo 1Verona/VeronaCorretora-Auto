@@ -49,7 +49,7 @@ def cache_path(filename: str) -> Path:
     return CACHE_DIR / filename
 
 
-@dataclass(slots=True)
+@dataclass
 class ScraperConfig:
     credentials_path: Path = DEFAULT_CREDENTIALS_PATH
     spreadsheet_id: str = DEFAULT_SPREADSHEET_ID

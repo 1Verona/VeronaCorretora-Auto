@@ -3,3 +3,5 @@ google-api-python-client==2.131.0
 google-auth==2.29.0
 google-auth-httplib2==0.2.0
 playwright>=1.44,<2
+python-telegram-bot>=21.0,<22
+requests>=2.31,<3

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import socket
 import threading
 import traceback
 from copy import deepcopy
@@ -25,9 +26,22 @@ from scraper import (
     preview_white_leads,
     run_scrape,
 )
+from telegram_bot import TelegramBot
 
 BASE_DIR = Path(__file__).resolve().parent
 CREDENTIALS_PATH = DEFAULT_CREDENTIALS_PATH
+FLASK_PORT_FILE = BASE_DIR / ".flask_port"
+
+
+def find_free_port(start: int = 5050, max_attempts: int = 10) -> int:
+    for port in range(start, start + max_attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError(f"Nenhuma porta livre entre {start} e {start + max_attempts - 1}.")
 
 PROGRESS_RE = re.compile(r"\[(\d+)/(\d+)\]")
 
@@ -162,6 +176,10 @@ class JobManager:
 
 
 job_manager = JobManager()
+telegram_bot = TelegramBot(
+    token="8457276789:AAHVPjx_-DVEDFrXSmd4Bd5S37grpskdnHE",
+    flask_url="http://127.0.0.1:5050",
+)
 
 
 def build_config_from_request(form) -> ScraperConfig:
@@ -295,4 +313,13 @@ def healthcheck():
 
 if __name__ == "__main__":
     cleanup_cache()
-    app.run(host="127.0.0.1", port=5050, debug=False, use_reloader=False)
+    port = find_free_port(5050)
+    FLASK_PORT_FILE.write_text(str(port))
+    telegram_bot.flask_url = f"http://127.0.0.1:{port}"
+    print(f" * Backend na porta {port}")
+    flask_thread = threading.Thread(
+        target=lambda: app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False),
+        daemon=True,
+    )
+    flask_thread.start()
+    telegram_bot.start()
