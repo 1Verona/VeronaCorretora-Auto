@@ -18,8 +18,20 @@ export default function App() {
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [found, setFound] = useState(0)
   const [error, setError] = useState(null)
+  const [sources, setSources] = useState([])
+  const [sourcesOpen, setSourcesOpen] = useState(false)
+  const [sourcesDirty, setSourcesDirty] = useState(false)
+  const [sourcesSaving, setSourcesSaving] = useState(false)
+  const [dragIndex, setDragIndex] = useState(null)
+  const [outreachOpen, setOutreachOpen] = useState(false)
+  const [outreachConfig, setOutreachConfig] = useState(null)
+  const [outreachStatus, setOutreachStatus] = useState(null)
+  const [outreachDirty, setOutreachDirty] = useState(false)
+  const [outreachSaving, setOutreachSaving] = useState(false)
+  const [conversations, setConversations] = useState([])
   const pollRef = useRef(null)
   const logsRef = useRef(null)
+  const outreachPollRef = useRef(null)
 
   useEffect(() => {
     fetch('/status')
@@ -40,6 +52,21 @@ export default function App() {
       })
       .catch(() => {})
   }, [])
+
+  const loadSources = useCallback(async () => {
+    try {
+      const res = await fetch('/sources')
+      const data = await res.json()
+      if (Array.isArray(data.sources)) {
+        setSources(data.sources)
+        setSourcesDirty(false)
+      }
+    } catch {}
+  }, [])
+
+  useEffect(() => {
+    if (connected) loadSources()
+  }, [connected, loadSources])
 
   const applyJob = useCallback((job) => {
     setLogs(job.logs || [])
@@ -128,6 +155,172 @@ export default function App() {
     }
   }
 
+  const toggleSourceEnabled = (index) => {
+    setSources((prev) => {
+      const next = [...prev]
+      next[index] = { ...next[index], enabled: !next[index].enabled }
+      return next
+    })
+    setSourcesDirty(true)
+  }
+
+  const handleDragStart = (index) => (e) => {
+    setDragIndex(index)
+    e.dataTransfer.effectAllowed = 'move'
+  }
+
+  const handleDragOver = (index) => (e) => {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    if (dragIndex === null || dragIndex === index) return
+    setSources((prev) => {
+      const next = [...prev]
+      const [moved] = next.splice(dragIndex, 1)
+      next.splice(index, 0, moved)
+      return next
+    })
+    setDragIndex(index)
+    setSourcesDirty(true)
+  }
+
+  const handleDragEnd = () => {
+    setDragIndex(null)
+  }
+
+  const saveSources = async () => {
+    setSourcesSaving(true)
+    try {
+      const res = await fetch('/sources', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sources }),
+      })
+      const data = await res.json()
+      if (data.ok) {
+        setSourcesDirty(false)
+      } else {
+        setError(data.error || 'Falha ao salvar fontes')
+      }
+    } catch {
+      setError('Falha ao salvar fontes')
+    } finally {
+      setSourcesSaving(false)
+    }
+  }
+
+  const loadOutreachConfig = useCallback(async () => {
+    try {
+      const res = await fetch('/outreach/config')
+      const data = await res.json()
+      setOutreachConfig(data)
+      setOutreachDirty(false)
+    } catch {}
+  }, [])
+
+  const loadOutreachStatus = useCallback(async () => {
+    try {
+      const [statusRes, convRes] = await Promise.all([
+        fetch('/outreach/status').then((r) => r.json()),
+        fetch('/outreach/conversations').then((r) => r.json()),
+      ])
+      setOutreachStatus(statusRes)
+      setConversations(convRes.conversations || [])
+    } catch {}
+  }, [])
+
+  useEffect(() => {
+    if (connected) loadOutreachConfig()
+  }, [connected, loadOutreachConfig])
+
+  useEffect(() => {
+    if (!outreachOpen) {
+      if (outreachPollRef.current) {
+        clearInterval(outreachPollRef.current)
+        outreachPollRef.current = null
+      }
+      return
+    }
+    loadOutreachStatus()
+    outreachPollRef.current = setInterval(loadOutreachStatus, 5000)
+    return () => {
+      if (outreachPollRef.current) clearInterval(outreachPollRef.current)
+    }
+  }, [outreachOpen, loadOutreachStatus])
+
+  const updateOutreachField = (field, value) => {
+    setOutreachConfig((prev) => ({ ...(prev || {}), [field]: value }))
+    setOutreachDirty(true)
+  }
+
+  const updateTemplate = (i, value) => {
+    setOutreachConfig((prev) => {
+      const tpls = [...(prev?.templates || [])]
+      tpls[i] = value
+      return { ...prev, templates: tpls }
+    })
+    setOutreachDirty(true)
+  }
+
+  const addTemplate = () => {
+    setOutreachConfig((prev) => ({
+      ...prev,
+      templates: [...(prev?.templates || []), 'Olá {nome}, '],
+    }))
+    setOutreachDirty(true)
+  }
+
+  const removeTemplate = (i) => {
+    setOutreachConfig((prev) => ({
+      ...prev,
+      templates: (prev?.templates || []).filter((_, idx) => idx !== i),
+    }))
+    setOutreachDirty(true)
+  }
+
+  const saveOutreachConfig = async () => {
+    if (!outreachConfig) return
+    setOutreachSaving(true)
+    try {
+      const res = await fetch('/outreach/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(outreachConfig),
+      })
+      const data = await res.json()
+      if (data.config) {
+        setOutreachConfig(data.config)
+        setOutreachDirty(false)
+      }
+    } finally {
+      setOutreachSaving(false)
+    }
+  }
+
+  const toggleOutreach = async () => {
+    const path = outreachConfig?.enabled ? '/outreach/stop' : '/outreach/start'
+    try {
+      const res = await fetch(path, { method: 'POST' })
+      const data = await res.json()
+      if (data.config) setOutreachConfig(data.config)
+      loadOutreachStatus()
+    } catch {}
+  }
+
+  const dispatchNow = async () => {
+    try {
+      await fetch('/outreach/dispatch-now', { method: 'POST' })
+      loadOutreachStatus()
+    } catch {}
+  }
+
+  const pauseConversation = async (phone, paused) => {
+    const path = paused ? 'resume' : 'pause'
+    try {
+      await fetch(`/outreach/conversations/${phone}/${path}`, { method: 'POST' })
+      loadOutreachStatus()
+    } catch {}
+  }
+
   if (connected === null) {
     return (
       <div className="app">
@@ -154,6 +347,7 @@ export default function App() {
   }
 
   const showStats = active || status === 'completed' || status === 'stopped' || progress.current > 0
+  const enabledCount = sources.filter((s) => s.enabled).length
 
   return (
     <div className="app">
@@ -239,6 +433,236 @@ export default function App() {
             ))}
           </div>
         )}
+
+        <section className="sources">
+          <button
+            className="sources-header"
+            onClick={() => setSourcesOpen((v) => !v)}
+          >
+            <span className="sources-title">Fontes de leads</span>
+            <span className="sources-summary">
+              {sources.length === 0 ? '—' : `${enabledCount}/${sources.length} ativas`}
+              <span className={`chevron ${sourcesOpen ? 'open' : ''}`}>▾</span>
+            </span>
+          </button>
+
+          {sourcesOpen && (
+            <div className="sources-body">
+              {sources.length === 0 ? (
+                <p className="muted small">Nenhuma aba encontrada.</p>
+              ) : (
+                <>
+                  <p className="hint">Arraste para reordenar. Desmarque para ignorar.</p>
+                  <ul className="source-list" onDragEnd={handleDragEnd}>
+                    {sources.map((src, idx) => (
+                      <li
+                        key={src.name}
+                        className={`source-item ${dragIndex === idx ? 'dragging' : ''} ${!src.enabled ? 'disabled' : ''}`}
+                        draggable
+                        onDragStart={handleDragStart(idx)}
+                        onDragOver={handleDragOver(idx)}
+                      >
+                        <span className="grip">⋮⋮</span>
+                        <span className="rank">{idx + 1}</span>
+                        <label className="source-toggle">
+                          <input
+                            type="checkbox"
+                            checked={src.enabled}
+                            onChange={() => toggleSourceEnabled(idx)}
+                          />
+                          <span className="source-name">{src.name}</span>
+                        </label>
+                        <span className="lead-count">{src.lead_count}</span>
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="sources-actions">
+                    <button
+                      className="btn-secondary"
+                      onClick={loadSources}
+                      disabled={sourcesSaving}
+                    >
+                      Recarregar
+                    </button>
+                    <button
+                      className="btn-primary"
+                      onClick={saveSources}
+                      disabled={!sourcesDirty || sourcesSaving}
+                    >
+                      {sourcesSaving ? 'Salvando…' : sourcesDirty ? 'Salvar' : 'Salvo'}
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+        </section>
+
+        <section className="sources">
+          <button
+            className="sources-header"
+            onClick={() => setOutreachOpen((v) => !v)}
+          >
+            <span className="sources-title">Disparo WhatsApp</span>
+            <span className="sources-summary">
+              {outreachConfig?.enabled ? '🟢 ligado' : '🔴 desligado'}
+              {outreachStatus?.queue_size != null && ` · fila ${outreachStatus.queue_size}`}
+              <span className={`chevron ${outreachOpen ? 'open' : ''}`}>▾</span>
+            </span>
+          </button>
+
+          {outreachOpen && outreachConfig && (
+            <div className="sources-body">
+              <div className="outreach-toggle-row">
+                <button
+                  className={`toggle-btn ${outreachConfig.enabled ? 'on' : ''}`}
+                  onClick={toggleOutreach}
+                >
+                  <span className="track">
+                    <span className="thumb" />
+                  </span>
+                </button>
+                <span className={`toggle-label ${outreachConfig.enabled ? 'green' : ''}`}>
+                  {outreachConfig.enabled ? 'Disparo ligado' : 'Disparo desligado'}
+                </span>
+                <button className="btn-secondary" onClick={dispatchNow} style={{ marginLeft: 'auto' }}>
+                  Enviar 1 agora
+                </button>
+              </div>
+
+              {outreachStatus && (
+                <div className="outreach-status">
+                  <div>📤 Enviados hoje: <b>{outreachStatus.sent_today}</b>/{outreachStatus.daily_limit}</div>
+                  <div>📋 Fila: <b>{outreachStatus.queue_size}</b></div>
+                  <div>⏱️ Janela: <b>{outreachStatus.in_window ? 'dentro' : 'fora'}</b></div>
+                  {outreachStatus.next_dispatch_in_seconds != null && (
+                    <div>➡️ Próximo: {outreachStatus.next_dispatch_in_seconds}s</div>
+                  )}
+                  {outreachStatus.paused_reason && (
+                    <div className="alert amber" style={{ marginTop: 6 }}>
+                      ⏸️ {outreachStatus.paused_reason}
+                    </div>
+                  )}
+                  {!outreachStatus.evolution_configured && (
+                    <div className="alert red" style={{ marginTop: 6 }}>
+                      ⚠️ Evolution não configurado no .env
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="outreach-grid">
+                <label>
+                  Hora início
+                  <input
+                    type="number"
+                    min="0"
+                    max="23"
+                    value={outreachConfig.hour_start}
+                    onChange={(e) => updateOutreachField('hour_start', Number(e.target.value))}
+                  />
+                </label>
+                <label>
+                  Hora fim
+                  <input
+                    type="number"
+                    min="0"
+                    max="23"
+                    value={outreachConfig.hour_end}
+                    onChange={(e) => updateOutreachField('hour_end', Number(e.target.value))}
+                  />
+                </label>
+                <label>
+                  Limite diário
+                  <input
+                    type="number"
+                    min="1"
+                    value={outreachConfig.daily_limit}
+                    onChange={(e) => updateOutreachField('daily_limit', Number(e.target.value))}
+                  />
+                </label>
+                <label>
+                  Delay mín (s)
+                  <input
+                    type="number"
+                    min="1"
+                    value={outreachConfig.min_delay}
+                    onChange={(e) => updateOutreachField('min_delay', Number(e.target.value))}
+                  />
+                </label>
+                <label>
+                  Delay máx (s)
+                  <input
+                    type="number"
+                    min="1"
+                    value={outreachConfig.max_delay}
+                    onChange={(e) => updateOutreachField('max_delay', Number(e.target.value))}
+                  />
+                </label>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={outreachConfig.weekdays_only}
+                    onChange={(e) => updateOutreachField('weekdays_only', e.target.checked)}
+                  />
+                  <span>Só dias úteis</span>
+                </label>
+              </div>
+
+              <div className="outreach-templates">
+                <div className="outreach-templates-header">
+                  <h4>Templates (use <code>{'{nome}'}</code>)</h4>
+                  <button className="btn-secondary small" onClick={addTemplate}>+ Adicionar</button>
+                </div>
+                {(outreachConfig.templates || []).map((tpl, i) => (
+                  <div key={i} className="template-row">
+                    <textarea
+                      rows={3}
+                      value={tpl}
+                      onChange={(e) => updateTemplate(i, e.target.value)}
+                    />
+                    <button className="btn-icon" onClick={() => removeTemplate(i)} title="Remover">✕</button>
+                  </div>
+                ))}
+              </div>
+
+              <div className="sources-actions">
+                <button className="btn-secondary" onClick={loadOutreachConfig} disabled={outreachSaving}>
+                  Recarregar
+                </button>
+                <button
+                  className="btn-primary"
+                  onClick={saveOutreachConfig}
+                  disabled={!outreachDirty || outreachSaving}
+                >
+                  {outreachSaving ? 'Salvando…' : outreachDirty ? 'Salvar' : 'Salvo'}
+                </button>
+              </div>
+
+              {conversations.length > 0 && (
+                <div className="conversations">
+                  <h4>Conversas ({conversations.length})</h4>
+                  <ul className="conversation-list">
+                    {conversations.slice(0, 20).map((c) => (
+                      <li key={c.phone} className={`conversation-item ${c.paused_by_broker ? 'paused' : ''}`}>
+                        <span className="conv-badge">{c.paused_by_broker ? '⏸️' : '🤖'}</span>
+                        <span className="conv-name">{c.nome || c.phone}</span>
+                        <span className="conv-stage">{c.stage}</span>
+                        <button
+                          className="btn-icon"
+                          onClick={() => pauseConversation(c.phone, c.paused_by_broker)}
+                          title={c.paused_by_broker ? 'Retomar bot' : 'Pausar bot'}
+                        >
+                          {c.paused_by_broker ? '▶' : '⏸'}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+        </section>
       </main>
     </div>
   )

@@ -28,6 +28,9 @@ export default defineConfig({
       '/job': backendUrl,
       '/connect': backendUrl,
       '/health': backendUrl,
+      '/sources': backendUrl,
+      '/outreach': backendUrl,
+      '/webhook': backendUrl,
     },
   },
 })

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -41,7 +42,46 @@ INTENT_KEYWORDS = {
         "preço", "preco", "quanto custa", "tabela", "simulação",
         "simulacao", "passar valor", "passar preço", "passar preco",
     ],
+    "consultar_cliente": [
+        "como tá", "como ta", "como está", "como esta", "status de",
+        "status do", "status da", "info sobre", "informação sobre",
+        "informacao sobre", "me fala do", "me fala da", "dados do",
+        "dados da", "telefone do", "telefone da", "qual o telefone",
+        "qual o status", "quem é", "quem e",
+    ],
+    "listar_followups": [
+        "follow up de hoje", "follow-up de hoje", "ligações de hoje",
+        "ligacoes de hoje", "quem tenho que ligar", "quem preciso ligar",
+        "retornos de hoje", "retornos da semana", "retorno hoje",
+        "agenda de hoje", "agenda do dia", "agenda da semana",
+        "follow ups", "follow-ups", "pendentes", "pendências", "pendencias",
+        "atrasados", "vencidos", "compromissos",
+    ],
+    "estatisticas": [
+        "quantos fechei", "quantos vendi", "estatística", "estatistica",
+        "estatísticas", "estatisticas", "resumo do mês", "resumo do mes",
+        "resumo da semana", "resumo geral", "balanço", "balanco",
+        "performance", "taxa de conversão", "taxa de conversao",
+        "como tô indo", "como to indo", "métricas", "metricas",
+        "quantos clientes",
+    ],
+    "adicionar_cliente": [
+        "adiciona", "adicionar", "cadastra", "cadastrar", "novo cliente",
+        "novo lead", "registra cliente", "registrar cliente",
+        "criar cliente", "cria cliente", "incluir cliente",
+    ],
+    "comando_scraping": [
+        "iniciar scraping", "rodar scraping", "começar coleta", "comecar coleta",
+        "iniciar coleta", "começar scraping", "comecar scraping",
+        "buscar leads", "coletar leads", "rodar coleta", "scraper",
+        "parar scraping", "parar coleta", "stop scraping", "interromper",
+        "status do job", "como tá o job", "como ta o job", "andamento do job",
+    ],
 }
+
+PRIORITY_INTENTS = ("fechou", "sem_interesse", "consultar_cliente", "listar_followups", "estatisticas", "adicionar_cliente", "comando_scraping")
+
+QUERY_INTENTS = {"consultar_cliente", "listar_followups", "estatisticas", "comando_scraping"}
 
 MONTH_MAP = {
     "janeiro": 1, "jan": 1, "fevereiro": 2, "fev": 2, "março": 3,
@@ -80,15 +120,16 @@ class NLPResult:
 
 def normalize_text(text: str) -> str:
     text = text.lower().strip()
-    text = re.sub(r"[^\w\sà-ú]", "", text)
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    text = re.sub(r"[^\w\s]", "", text)
     text = re.sub(r"\s+", " ", text)
     return text
 
 
 def detect_intent(message: str) -> tuple[str, float]:
     normalized = normalize_text(message)
-    best_intent = "unknown"
-    best_score = 0.0
+    scores: dict[str, float] = {}
 
     for intent, keywords in INTENT_KEYWORDS.items():
         score = 0.0
@@ -99,15 +140,16 @@ def detect_intent(message: str) -> tuple[str, float]:
                 score += kw_len * 1.5
                 if normalized.startswith(kw_norm) or normalized.endswith(kw_norm):
                     score += 1.0
-        if score > best_score:
-            best_score = score
-            best_intent = intent
+        if intent in PRIORITY_INTENTS and score > 0:
+            score += 1.0
+        if score > 0:
+            scores[intent] = score
 
-    if best_score > 0:
-        confidence = min(best_score / 5.0, 1.0)
-    else:
-        confidence = 0.0
+    if not scores:
+        return "unknown", 0.0
 
+    best_intent, best_score = max(scores.items(), key=lambda x: x[1])
+    confidence = min(best_score / 5.0, 1.0)
     return best_intent, confidence
 
 

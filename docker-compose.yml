@@ -1,0 +1,16 @@
+services:
+  verona-auto:
+    build: .
+    container_name: verona-auto
+    restart: unless-stopped
+    ports:
+      - "5050:5050"
+    env_file:
+      - .env
+    volumes:
+      - ./credentials.json:/app/credentials.json:ro
+      - ./conversations.json:/app/conversations.json
+      - ./outreach_config.json:/app/outreach_config.json
+      - ./bot_contexts.json:/app/bot_contexts.json
+      - ./lead_priority.json:/app/lead_priority.json
+      - ./cache:/app/cache

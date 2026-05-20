@@ -18,6 +18,7 @@ from playwright.async_api import BrowserContext, Page, async_playwright
 
 BASE_DIR = Path(__file__).resolve().parent
 CACHE_DIR = BASE_DIR / "cache"
+PRIORITY_CONFIG_PATH = BASE_DIR / "lead_priority.json"
 DEFAULT_SPREADSHEET_ID = "1QRnMXp8lTmIefhHnP5LdSoin1QMj_imewcf3RAh_KzI"
 DEFAULT_CREDENTIALS_PATH = BASE_DIR / "credentials.json"
 DEFAULT_OUTPUT_SHEET = "Leads_OAB_Scraper"
@@ -27,6 +28,7 @@ OAB_URL = "https://cna.oab.org.br/"
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
 ]
 PHONE_REGEX = re.compile(r"(?:\+?55\s*)?(?:\(?\d{2}\)?\s*)?(?:9\d{4}|\d{4})[-\s]?\d{4}")
 EMAIL_REGEX = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
@@ -155,12 +157,44 @@ def extract_row_values(cells: list[dict[str, Any]]) -> list[str]:
     return values
 
 
+def load_priority_config() -> dict[str, Any]:
+    if not PRIORITY_CONFIG_PATH.exists():
+        return {"order": [], "enabled": {}}
+    try:
+        data = json.loads(PRIORITY_CONFIG_PATH.read_text(encoding="utf-8"))
+        return {
+            "order": list(data.get("order", [])),
+            "enabled": dict(data.get("enabled", {})),
+        }
+    except Exception:
+        return {"order": [], "enabled": {}}
+
+
+def save_priority_config(order: list[str], enabled: dict[str, bool]) -> dict[str, Any]:
+    config = {"order": order, "enabled": enabled}
+    PRIORITY_CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    return config
+
+
+def apply_priority(sheet_titles: list[str], config: dict[str, Any] | None = None) -> list[str]:
+    cfg = config or load_priority_config()
+    order = cfg.get("order", [])
+    enabled = cfg.get("enabled", {})
+
+    available = set(sheet_titles)
+    ordered = [s for s in order if s in available]
+    extras = [s for s in sheet_titles if s not in ordered]
+    full = ordered + extras
+    return [s for s in full if enabled.get(s, True)]
+
+
 def get_white_leads(
     service,
     spreadsheet_id: str,
     *,
     output_sheet_name: str = DEFAULT_OUTPUT_SHEET,
     name_column_index: int = DEFAULT_NAME_COLUMN_INDEX,
+    priority_config: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     spreadsheet = service.spreadsheets().get(
         spreadsheetId=spreadsheet_id,
@@ -172,14 +206,22 @@ def get_white_leads(
         ),
     ).execute()
 
+    sheets_by_title: dict[str, dict[str, Any]] = {}
+    for sheet in spreadsheet.get("sheets", []):
+        title = sheet.get("properties", {}).get("title", "")
+        if title and title != output_sheet_name:
+            sheets_by_title[title] = sheet
+
+    cfg = priority_config if priority_config is not None else load_priority_config()
+    ordered_titles = apply_priority(list(sheets_by_title.keys()), cfg)
+
     white_rows: list[dict[str, Any]] = []
     header_keywords = {"nome", "name", "advogado"}
 
-    for sheet in spreadsheet.get("sheets", []):
-        sheet_title = sheet.get("properties", {}).get("title", "")
-        if sheet_title == output_sheet_name:
+    for sheet_title in ordered_titles:
+        sheet = sheets_by_title.get(sheet_title)
+        if not sheet:
             continue
-
         rows = sheet.get("data", [{}])[0].get("rowData", [])
 
         for row_index, row in enumerate(rows, start=1):
@@ -212,6 +254,40 @@ def get_white_leads(
             )
 
     return white_rows
+
+
+def count_leads_per_sheet(service, spreadsheet_id: str, output_sheet_name: str = DEFAULT_OUTPUT_SHEET, name_column_index: int = DEFAULT_NAME_COLUMN_INDEX) -> dict[str, int]:
+    spreadsheet = service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields=(
+            "sheets.properties.title,"
+            "sheets.data.rowData.values.formattedValue,"
+            "sheets.data.rowData.values.userEnteredFormat.backgroundColor"
+        ),
+    ).execute()
+
+    header_keywords = {"nome", "name", "advogado"}
+    counts: dict[str, int] = {}
+    for sheet in spreadsheet.get("sheets", []):
+        title = sheet.get("properties", {}).get("title", "")
+        if not title or title == output_sheet_name:
+            continue
+        rows = sheet.get("data", [{}])[0].get("rowData", [])
+        count = 0
+        for row in rows:
+            cells = row.get("values", [])
+            if len(cells) <= name_column_index:
+                continue
+            row_values = extract_row_values(cells)
+            name_cell = cells[name_column_index] or {}
+            raw_name = row_values[name_column_index].strip()
+            if not raw_name or raw_name.lower() in header_keywords:
+                continue
+            if not is_white_or_default(name_cell.get("userEnteredFormat", {}).get("backgroundColor")):
+                continue
+            count += 1
+        counts[title] = count
+    return counts
 
 
 def preview_white_leads(config: ScraperConfig) -> dict[str, Any]:

@@ -1,0 +1,17 @@
+[Unit]
+Description=Verona Corretora Auto (Flask + Telegram + Outreach Worker)
+After=network.target
+
+[Service]
+Type=simple
+User=verona
+WorkingDirectory=/opt/verona-auto
+EnvironmentFile=/opt/verona-auto/.env
+ExecStart=/opt/verona-auto/.venv/bin/python app.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

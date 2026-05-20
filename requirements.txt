@@ -2,6 +2,9 @@ flask==3.0.3
 google-api-python-client==2.131.0
 google-auth==2.29.0
 google-auth-httplib2==0.2.0
+openai>=1.40,<2
 playwright>=1.44,<2
+python-dotenv>=1.0,<2
 python-telegram-bot>=21.0,<22
+pytz>=2024.1
 requests>=2.31,<3

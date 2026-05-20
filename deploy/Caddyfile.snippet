@@ -1,0 +1,15 @@
+# Adicione em /etc/caddy/Caddyfile
+# Troque o domínio se for outro
+
+oabprev.goaether.xyz {
+    # Backend Python (Flask + endpoints /outreach, /webhook/evolution, etc)
+    reverse_proxy 127.0.0.1:5050
+
+    # Logs
+    log {
+        output file /var/log/caddy/verona-auto.log
+        format console
+    }
+}
+
+# Depois: sudo caddy reload --config /etc/caddy/Caddyfile

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import socket
 import threading
@@ -13,6 +14,7 @@ from uuid import uuid4
 from flask import Flask, jsonify, request
 from googleapiclient.errors import HttpError
 
+from outreach_worker import OutreachWorker, load_config, save_config
 from scraper import (
     DEFAULT_CREDENTIALS_PATH,
     DEFAULT_OUTPUT_SHEET,
@@ -20,13 +22,18 @@ from scraper import (
     DEFAULT_SPREADSHEET_ID,
     ScraperConfig,
     allowed_credential_file,
+    apply_priority,
+    build_sheets_service,
     cleanup_cache,
+    count_leads_per_sheet,
     inspect_spreadsheet,
+    load_priority_config,
     normalize_spreadsheet_id,
     preview_white_leads,
     run_scrape,
+    save_priority_config,
 )
-from telegram_bot import TelegramBot
+from telegram_bot import TELEGRAM_BOT_TOKEN, TelegramBot
 
 BASE_DIR = Path(__file__).resolve().parent
 CREDENTIALS_PATH = DEFAULT_CREDENTIALS_PATH
@@ -177,8 +184,30 @@ class JobManager:
 
 job_manager = JobManager()
 telegram_bot = TelegramBot(
-    token="8457276789:AAHVPjx_-DVEDFrXSmd4Bd5S37grpskdnHE",
+    token=TELEGRAM_BOT_TOKEN,
     flask_url="http://127.0.0.1:5050",
+)
+
+
+def _notify_broker(text: str) -> None:
+    try:
+        telegram_bot.send_broker_notification(text)
+    except Exception:
+        pass
+
+
+def _conversation_seed(lead: dict[str, Any]) -> None:
+    try:
+        from conversation_engine import register_outbound_first_contact
+
+        register_outbound_first_contact(lead)
+    except Exception:
+        pass
+
+
+outreach_worker = OutreachWorker(
+    notify_broker=_notify_broker,
+    conversation_hook=_conversation_seed,
 )
 
 
@@ -298,6 +327,59 @@ def job_status():
     return jsonify(state)
 
 
+@app.get("/sources")
+def list_sources():
+    if not CREDENTIALS_PATH.exists():
+        return jsonify({"error": "Configure as credenciais primeiro."}), 400
+    try:
+        service = build_sheets_service(CREDENTIALS_PATH)
+        counts = count_leads_per_sheet(service, DEFAULT_SPREADSHEET_ID)
+    except HttpError as exc:
+        message, code = format_google_error(exc)
+        return jsonify({"error": message}), code
+    except Exception as exc:
+        return jsonify({"error": f"Falha ao listar abas: {exc}"}), 500
+
+    cfg = load_priority_config()
+    available = list(counts.keys())
+    order = cfg.get("order", [])
+    enabled = cfg.get("enabled", {})
+
+    ordered = [s for s in order if s in counts]
+    extras = [s for s in available if s not in ordered]
+    final_order = ordered + extras
+
+    sources = [
+        {
+            "name": title,
+            "lead_count": counts.get(title, 0),
+            "enabled": enabled.get(title, True),
+        }
+        for title in final_order
+    ]
+    return jsonify({"sources": sources})
+
+
+@app.post("/sources")
+def update_sources():
+    payload = request.get_json(silent=True) or {}
+    sources = payload.get("sources")
+    if not isinstance(sources, list):
+        return jsonify({"error": "Formato inválido: esperado { sources: [...] }"}), 400
+
+    order: list[str] = []
+    enabled: dict[str, bool] = {}
+    for item in sources:
+        name = (item.get("name") or "").strip()
+        if not name:
+            continue
+        order.append(name)
+        enabled[name] = bool(item.get("enabled", True))
+
+    config = save_priority_config(order, enabled)
+    return jsonify({"ok": True, "config": config})
+
+
 @app.get("/health")
 def healthcheck():
     state = job_manager.get_state()
@@ -311,6 +393,119 @@ def healthcheck():
     )
 
 
+@app.get("/outreach/config")
+def outreach_get_config():
+    return jsonify(load_config())
+
+
+@app.post("/outreach/config")
+def outreach_set_config():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Formato inválido"}), 400
+    try:
+        current = load_config()
+        merged = {**current, **payload}
+        if "templates" in merged and not isinstance(merged["templates"], list):
+            return jsonify({"error": "templates precisa ser lista"}), 400
+        for int_field in ("hour_start", "hour_end", "daily_limit", "min_delay", "max_delay", "max_consecutive_errors"):
+            if int_field in merged:
+                merged[int_field] = int(merged[int_field])
+        saved = save_config(merged)
+        return jsonify({"ok": True, "config": saved})
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": f"Valor inválido: {exc}"}), 400
+
+
+@app.post("/outreach/start")
+def outreach_start():
+    config = load_config()
+    config["enabled"] = True
+    save_config(config)
+    outreach_worker.start()
+    return jsonify({"ok": True, "config": config})
+
+
+@app.post("/outreach/stop")
+def outreach_stop():
+    config = load_config()
+    config["enabled"] = False
+    save_config(config)
+    return jsonify({"ok": True, "config": config})
+
+
+@app.get("/outreach/status")
+def outreach_status():
+    return jsonify(outreach_worker.status())
+
+
+@app.post("/outreach/dispatch-now")
+def outreach_dispatch_now():
+    try:
+        result = outreach_worker.dispatch_one_now()
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    code = 200 if result.get("sent") else 409
+    return jsonify(result), code
+
+
+@app.get("/outreach/conversations")
+def outreach_list_conversations():
+    try:
+        from conversation_engine import list_conversations
+
+        return jsonify({"conversations": list_conversations()})
+    except Exception as exc:
+        return jsonify({"error": str(exc), "conversations": []}), 500
+
+
+@app.post("/outreach/conversations/<phone>/pause")
+def outreach_pause_conversation(phone: str):
+    try:
+        from conversation_engine import set_paused
+
+        ok = set_paused(phone, True)
+        return jsonify({"ok": ok})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.post("/outreach/conversations/<phone>/resume")
+def outreach_resume_conversation(phone: str):
+    try:
+        from conversation_engine import set_paused
+
+        ok = set_paused(phone, False)
+        return jsonify({"ok": ok})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.post("/webhook/evolution")
+def evolution_webhook():
+    expected_token = os.getenv("EVOLUTION_WEBHOOK_TOKEN", "").strip()
+    if expected_token:
+        auth = request.headers.get("Authorization", "")
+        token_query = request.args.get("token", "")
+        provided = ""
+        if auth.lower().startswith("bearer "):
+            provided = auth.split(" ", 1)[1].strip()
+        elif token_query:
+            provided = token_query.strip()
+        if provided != expected_token:
+            return jsonify({"error": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        from conversation_engine import handle_inbound_payload
+
+        result = handle_inbound_payload(payload, notify_broker=_notify_broker)
+        return jsonify({"ok": True, "result": result})
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 if __name__ == "__main__":
     cleanup_cache()
     port = find_free_port(5050)
@@ -322,4 +517,11 @@ if __name__ == "__main__":
         daemon=True,
     )
     flask_thread.start()
-    telegram_bot.start()
+
+    outreach_worker.start()
+
+    if not TELEGRAM_BOT_TOKEN:
+        print(" * AVISO: TELEGRAM_BOT_TOKEN não definido no .env — bot do Telegram desligado.")
+        flask_thread.join()
+    else:
+        telegram_bot.start()
