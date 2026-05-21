@@ -180,6 +180,12 @@ def handle_inbound_payload(
     if not phone or not text:
         return {"ignored": True, "reason": "sem phone/text"}
 
+    agent_cfg = load_agent_config()
+    if agent_cfg.get("test_mode"):
+        test_phone = normalize_phone(agent_cfg.get("test_phone") or "")
+        if not test_phone or phone != test_phone:
+            return {"ignored": True, "reason": "test_mode", "test_phone": test_phone}
+
     conv = _get(phone)
     if not conv:
         lead = _sheets.find_lead_by_phone(phone)

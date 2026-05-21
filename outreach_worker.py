@@ -12,7 +12,8 @@ from typing import Any, Callable
 import pytz
 from dotenv import load_dotenv
 
-from evolution_client import EvolutionClient, EvolutionError, to_jid
+from agent_config import load_config as load_agent_config
+from evolution_client import EvolutionClient, EvolutionError, normalize_phone, to_jid
 from sheet_manager import SheetManager
 from sheets_config import load_config as load_sheets_config
 
@@ -118,7 +119,12 @@ class OutreachWorker:
             queue_size = -1
             try:
                 source = (load_sheets_config().get("source_sheet") or "").strip() or None
-                queue_size = len(self.sheet_manager.get_leads_pending_first_contact(source, limit=200))
+                agent_cfg = load_agent_config()
+                pool = self.sheet_manager.get_leads_pending_first_contact(source, limit=200)
+                if agent_cfg.get("test_mode"):
+                    test_phone = normalize_phone(agent_cfg.get("test_phone") or "")
+                    pool = [c for c in pool if normalize_phone(c.get("telefone", "")) == test_phone]
+                queue_size = len(pool)
             except Exception:
                 queue_size = -1
             next_dispatch = None
@@ -135,6 +141,8 @@ class OutreachWorker:
                 "paused_reason": self._paused_reason,
                 "last_error": self._last_error,
                 "evolution_configured": self.evolution.configured,
+                "test_mode": bool(agent_cfg.get("test_mode")),
+                "test_phone": agent_cfg.get("test_phone", ""),
             }
 
     def _refresh_daily_counter(self, today: date) -> None:
@@ -199,7 +207,17 @@ class OutreachWorker:
             return {"sent": False, "error": "evolution_not_configured"}
 
         source = (load_sheets_config().get("source_sheet") or "").strip() or None
-        candidates = self.sheet_manager.get_leads_pending_first_contact(source, limit=1)
+        agent_cfg = load_agent_config()
+        if agent_cfg.get("test_mode"):
+            test_phone = normalize_phone(agent_cfg.get("test_phone") or "")
+            if not test_phone:
+                self._paused_reason = "modo de teste sem número configurado"
+                return {"sent": False, "error": "test_phone_missing"}
+            pool = self.sheet_manager.get_leads_pending_first_contact(source, limit=100)
+            candidates = [c for c in pool if normalize_phone(c.get("telefone", "")) == test_phone]
+        else:
+            candidates = self.sheet_manager.get_leads_pending_first_contact(source, limit=1)
+
         if not candidates:
             return {"sent": False, "empty": True}
 

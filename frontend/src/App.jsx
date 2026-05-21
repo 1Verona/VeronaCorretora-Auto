@@ -626,6 +626,7 @@ export default function App() {
               <span className="sources-title">Disparo WhatsApp</span>
             </span>
             <span className="sources-summary">
+              {outreachStatus?.test_mode && <span className="status-pill warn">teste</span>}
               <span className={`status-pill ${outreachConfig?.enabled ? 'on' : 'off'}`}>
                 {outreachConfig?.enabled ? 'ligado' : 'desligado'}
               </span>
@@ -801,6 +802,7 @@ export default function App() {
             <span className="sources-summary">
               {agentConfig ? (
                 <>
+                  {agentConfig.test_mode && <span className="status-pill warn">teste</span>}
                   <span className="status-pill info">{agentConfig.model}</span>
                   <span className="status-pill on">
                     {agentTools.filter((t) => t.enabled).length}/{agentTools.length} funções
@@ -815,6 +817,35 @@ export default function App() {
 
           {agentOpen && agentConfig && (
             <div className="sources-body">
+              <div className={`test-mode-box ${agentConfig.test_mode ? 'on' : ''}`}>
+                <div className="test-mode-row">
+                  <label className="test-mode-toggle">
+                    <input
+                      type="checkbox"
+                      checked={!!agentConfig.test_mode}
+                      onChange={(e) => updateAgentField('test_mode', e.target.checked)}
+                    />
+                    <div>
+                      <span className="test-mode-title">🧪 Modo de teste</span>
+                      <span className="test-mode-desc">
+                        Quando ligado, o sistema só envia disparos e responde mensagens do número configurado.
+                      </span>
+                    </div>
+                  </label>
+                </div>
+                {agentConfig.test_mode && (
+                  <label className="field" style={{ marginTop: 10, marginBottom: 0 }}>
+                    <span>Número de teste (somente dígitos, com DDI 55)</span>
+                    <input
+                      type="text"
+                      value={agentConfig.test_phone || ''}
+                      onChange={(e) => updateAgentField('test_phone', e.target.value)}
+                      placeholder="5548999320268"
+                    />
+                  </label>
+                )}
+              </div>
+
               <label className="field">
                 <span>Prompt do sistema (personalidade, regras, escopo)</span>
                 <textarea

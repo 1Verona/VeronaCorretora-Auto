@@ -135,6 +135,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "temperature": 0.4,
     "history_limit": 20,
     "enabled_tools": {name: True for name in TOOL_DEFINITIONS.keys()},
+    "test_mode": False,
+    "test_phone": "5548999320268",
 }
 
 CONFIG_FIELDS = set(DEFAULT_CONFIG.keys())
@@ -166,6 +168,8 @@ def _merge(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
         out["history_limit"] = DEFAULT_CONFIG["history_limit"]
     out["model"] = str(out.get("model") or DEFAULT_CONFIG["model"]).strip() or DEFAULT_CONFIG["model"]
     out["system_prompt"] = str(out.get("system_prompt") or DEFAULT_CONFIG["system_prompt"])
+    out["test_mode"] = bool(out.get("test_mode", False))
+    out["test_phone"] = "".join(ch for ch in str(out.get("test_phone") or "") if ch.isdigit())
     return out
 
 
