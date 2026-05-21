@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 from evolution_client import EvolutionClient, EvolutionError, to_jid
 from sheet_manager import SheetManager
+from sheets_config import load_config as load_sheets_config
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -39,7 +40,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_delay": 180,
     "max_consecutive_errors": 3,
     "templates": DEFAULT_TEMPLATES,
-    "source_sheet": "",
 }
 
 CONFIG_FIELDS = set(DEFAULT_CONFIG.keys())
@@ -117,7 +117,7 @@ class OutreachWorker:
             self._refresh_daily_counter(now.date())
             queue_size = -1
             try:
-                source = config.get("source_sheet") or None
+                source = (load_sheets_config().get("source_sheet") or "").strip() or None
                 queue_size = len(self.sheet_manager.get_leads_pending_first_contact(source, limit=200))
             except Exception:
                 queue_size = -1
@@ -198,7 +198,7 @@ class OutreachWorker:
             self._paused_reason = "Evolution não configurado"
             return {"sent": False, "error": "evolution_not_configured"}
 
-        source = config.get("source_sheet") or None
+        source = (load_sheets_config().get("source_sheet") or "").strip() or None
         candidates = self.sheet_manager.get_leads_pending_first_contact(source, limit=1)
         if not candidates:
             return {"sent": False, "empty": True}

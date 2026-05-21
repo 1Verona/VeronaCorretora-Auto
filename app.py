@@ -14,6 +14,7 @@ from uuid import uuid4
 from flask import Flask, jsonify, request
 from googleapiclient.errors import HttpError
 
+from agent_config import load_config as load_agent_cfg, save_config as save_agent_cfg, tools_catalog
 from outreach_worker import OutreachWorker, load_config, save_config
 from scraper import (
     DEFAULT_CREDENTIALS_PATH,
@@ -33,6 +34,7 @@ from scraper import (
     run_scrape,
     save_priority_config,
 )
+from sheets_config import load_config as load_sheets_cfg, save_config as save_sheets_cfg
 from telegram_bot import TELEGRAM_BOT_TOKEN, TelegramBot
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -214,11 +216,12 @@ outreach_worker = OutreachWorker(
 def build_config_from_request(form) -> ScraperConfig:
     limit_value = (form.get("limit") or "").strip()
     limit = int(limit_value) if limit_value else None
+    cfg = load_sheets_cfg()
     return ScraperConfig(
         credentials_path=CREDENTIALS_PATH,
-        spreadsheet_id=normalize_spreadsheet_id(form.get("spreadsheet_id")),
-        output_sheet_name=(form.get("output_sheet_name") or DEFAULT_OUTPUT_SHEET).strip() or DEFAULT_OUTPUT_SHEET,
-        seccional=(form.get("seccional") or DEFAULT_SECCIONAL).strip() or DEFAULT_SECCIONAL,
+        spreadsheet_id=normalize_spreadsheet_id(form.get("spreadsheet_id") or cfg["spreadsheet_id"]),
+        output_sheet_name=(form.get("output_sheet_name") or cfg["output_sheet_name"]).strip() or cfg["output_sheet_name"],
+        seccional=(form.get("seccional") or cfg["seccional"]).strip() or cfg["seccional"],
         limit=limit,
         headless=False,
     )
@@ -283,7 +286,7 @@ def credentials_status():
         return jsonify({"connected": False, "message": "Nenhum credentials.json encontrado."})
 
     try:
-        payload = inspect_current_connection(DEFAULT_SPREADSHEET_ID)
+        payload = inspect_current_connection(load_sheets_cfg()["spreadsheet_id"])
     except HttpError as exc:
         message, _ = format_google_error(exc)
         return jsonify({"connected": False, "message": message}), 200
@@ -333,7 +336,7 @@ def list_sources():
         return jsonify({"error": "Configure as credenciais primeiro."}), 400
     try:
         service = build_sheets_service(CREDENTIALS_PATH)
-        counts = count_leads_per_sheet(service, DEFAULT_SPREADSHEET_ID)
+        counts = count_leads_per_sheet(service, load_sheets_cfg()["spreadsheet_id"])
     except HttpError as exc:
         message, code = format_google_error(exc)
         return jsonify({"error": message}), code
@@ -479,6 +482,44 @@ def outreach_resume_conversation(phone: str):
         return jsonify({"ok": ok})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+@app.get("/agent/config")
+def agent_get_config():
+    return jsonify(load_agent_cfg())
+
+
+@app.post("/agent/config")
+def agent_set_config():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Formato inválido"}), 400
+    try:
+        saved = save_agent_cfg(payload)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": f"Valor inválido: {exc}"}), 400
+    return jsonify({"ok": True, "config": saved})
+
+
+@app.get("/agent/tools")
+def agent_get_tools():
+    return jsonify({"tools": tools_catalog()})
+
+
+@app.get("/sheets/config")
+def sheets_get_config():
+    return jsonify(load_sheets_cfg())
+
+
+@app.post("/sheets/config")
+def sheets_set_config():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Formato inválido"}), 400
+    if "spreadsheet_id" in payload:
+        payload["spreadsheet_id"] = normalize_spreadsheet_id(payload.get("spreadsheet_id"))
+    saved = save_sheets_cfg(payload)
+    return jsonify({"ok": True, "config": saved})
 
 
 @app.post("/webhook/evolution")

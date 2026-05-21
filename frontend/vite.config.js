@@ -30,6 +30,8 @@ export default defineConfig({
       '/health': backendUrl,
       '/sources': backendUrl,
       '/outreach': backendUrl,
+      '/agent': backendUrl,
+      '/sheets': backendUrl,
       '/webhook': backendUrl,
     },
   },

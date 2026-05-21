@@ -29,6 +29,15 @@ export default function App() {
   const [outreachDirty, setOutreachDirty] = useState(false)
   const [outreachSaving, setOutreachSaving] = useState(false)
   const [conversations, setConversations] = useState([])
+  const [agentOpen, setAgentOpen] = useState(false)
+  const [agentConfig, setAgentConfig] = useState(null)
+  const [agentTools, setAgentTools] = useState([])
+  const [agentDirty, setAgentDirty] = useState(false)
+  const [agentSaving, setAgentSaving] = useState(false)
+  const [sheetsOpen, setSheetsOpen] = useState(false)
+  const [sheetsConfig, setSheetsConfig] = useState(null)
+  const [sheetsDirty, setSheetsDirty] = useState(false)
+  const [sheetsSaving, setSheetsSaving] = useState(false)
   const pollRef = useRef(null)
   const logsRef = useRef(null)
   const outreachPollRef = useRef(null)
@@ -319,6 +328,105 @@ export default function App() {
       await fetch(`/outreach/conversations/${phone}/${path}`, { method: 'POST' })
       loadOutreachStatus()
     } catch {}
+  }
+
+  const loadAgentConfig = useCallback(async () => {
+    try {
+      const [cfgRes, toolsRes] = await Promise.all([
+        fetch('/agent/config').then((r) => r.json()),
+        fetch('/agent/tools').then((r) => r.json()),
+      ])
+      setAgentConfig(cfgRes)
+      setAgentTools(toolsRes.tools || [])
+      setAgentDirty(false)
+    } catch {}
+  }, [])
+
+  useEffect(() => {
+    if (connected && agentOpen && !agentConfig) loadAgentConfig()
+  }, [connected, agentOpen, agentConfig, loadAgentConfig])
+
+  const updateAgentField = (field, value) => {
+    setAgentConfig((prev) => ({ ...(prev || {}), [field]: value }))
+    setAgentDirty(true)
+  }
+
+  const toggleAgentTool = (name) => {
+    setAgentConfig((prev) => {
+      const enabled = { ...(prev?.enabled_tools || {}) }
+      enabled[name] = !enabled[name]
+      return { ...prev, enabled_tools: enabled }
+    })
+    setAgentTools((prev) =>
+      prev.map((t) => (t.name === name && !t.required ? { ...t, enabled: !t.enabled } : t)),
+    )
+    setAgentDirty(true)
+  }
+
+  const saveAgentConfig = async () => {
+    if (!agentConfig) return
+    setAgentSaving(true)
+    try {
+      const res = await fetch('/agent/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(agentConfig),
+      })
+      const data = await res.json()
+      if (data.config) {
+        setAgentConfig(data.config)
+        setAgentDirty(false)
+        const toolsRes = await fetch('/agent/tools').then((r) => r.json())
+        setAgentTools(toolsRes.tools || [])
+      } else if (data.error) {
+        setError(data.error)
+      }
+    } catch {
+      setError('Falha ao salvar identidade')
+    } finally {
+      setAgentSaving(false)
+    }
+  }
+
+  const loadSheetsConfig = useCallback(async () => {
+    try {
+      const data = await fetch('/sheets/config').then((r) => r.json())
+      setSheetsConfig(data)
+      setSheetsDirty(false)
+    } catch {}
+  }, [])
+
+  useEffect(() => {
+    if (connected && sheetsOpen && !sheetsConfig) loadSheetsConfig()
+  }, [connected, sheetsOpen, sheetsConfig, loadSheetsConfig])
+
+  const updateSheetsField = (field, value) => {
+    setSheetsConfig((prev) => ({ ...(prev || {}), [field]: value }))
+    setSheetsDirty(true)
+  }
+
+  const saveSheetsConfig = async () => {
+    if (!sheetsConfig) return
+    setSheetsSaving(true)
+    try {
+      const res = await fetch('/sheets/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(sheetsConfig),
+      })
+      const data = await res.json()
+      if (data.config) {
+        setSheetsConfig(data.config)
+        setSheetsDirty(false)
+        loadSources()
+      } else if (data.error) {
+        setError(data.error)
+      }
+    } catch {
+      setError('Falha ao salvar planilha')
+    } finally {
+      setSheetsSaving(false)
+    }
   }
 
   if (connected === null) {
@@ -660,6 +768,175 @@ export default function App() {
                   </ul>
                 </div>
               )}
+            </div>
+          )}
+        </section>
+
+        <section className="sources">
+          <button
+            className="sources-header"
+            onClick={() => setAgentOpen((v) => !v)}
+          >
+            <span className="sources-title">Identidade do agente</span>
+            <span className="sources-summary">
+              {agentConfig ? `${agentConfig.model} · ${(agentTools.filter((t) => t.enabled).length)}/${agentTools.length} funções` : '—'}
+              <span className={`chevron ${agentOpen ? 'open' : ''}`}>▾</span>
+            </span>
+          </button>
+
+          {agentOpen && agentConfig && (
+            <div className="sources-body">
+              <label className="field">
+                <span>Prompt do sistema (personalidade, regras, escopo)</span>
+                <textarea
+                  className="prompt-area"
+                  rows={14}
+                  value={agentConfig.system_prompt || ''}
+                  onChange={(e) => updateAgentField('system_prompt', e.target.value)}
+                />
+              </label>
+
+              <div className="outreach-grid">
+                <label>
+                  Modelo
+                  <input
+                    type="text"
+                    value={agentConfig.model || ''}
+                    onChange={(e) => updateAgentField('model', e.target.value)}
+                    placeholder="gpt-4o-mini"
+                  />
+                </label>
+                <label>
+                  Temperatura
+                  <input
+                    type="number"
+                    min="0"
+                    max="2"
+                    step="0.1"
+                    value={agentConfig.temperature ?? 0.4}
+                    onChange={(e) => updateAgentField('temperature', Number(e.target.value))}
+                  />
+                </label>
+                <label>
+                  Memória (últimas msgs)
+                  <input
+                    type="number"
+                    min="2"
+                    max="100"
+                    value={agentConfig.history_limit ?? 20}
+                    onChange={(e) => updateAgentField('history_limit', Number(e.target.value))}
+                  />
+                </label>
+              </div>
+
+              <div className="tools-section">
+                <h4>Funções disponíveis ao agente</h4>
+                <p className="hint">Desmarque para impedir que o agente use a função. "Responder" é obrigatória.</p>
+                <ul className="tools-list">
+                  {agentTools.map((tool) => (
+                    <li key={tool.name} className={`tool-item ${tool.enabled ? '' : 'off'} ${tool.required ? 'required' : ''}`}>
+                      <label className="tool-toggle">
+                        <input
+                          type="checkbox"
+                          checked={tool.enabled}
+                          disabled={tool.required}
+                          onChange={() => toggleAgentTool(tool.name)}
+                        />
+                        <div className="tool-info">
+                          <span className="tool-name">{tool.label}</span>
+                          <span className="tool-desc">{tool.description}</span>
+                        </div>
+                        {tool.required && <span className="tool-badge">obrigatória</span>}
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+
+              <div className="sources-actions">
+                <button className="btn-secondary" onClick={loadAgentConfig} disabled={agentSaving}>
+                  Recarregar
+                </button>
+                <button
+                  className="btn-primary"
+                  onClick={saveAgentConfig}
+                  disabled={!agentDirty || agentSaving}
+                >
+                  {agentSaving ? 'Salvando…' : agentDirty ? 'Salvar' : 'Salvo'}
+                </button>
+              </div>
+            </div>
+          )}
+        </section>
+
+        <section className="sources">
+          <button
+            className="sources-header"
+            onClick={() => setSheetsOpen((v) => !v)}
+          >
+            <span className="sources-title">Planilha de leads</span>
+            <span className="sources-summary">
+              {sheetsConfig ? (sheetsConfig.source_sheet ? `aba: ${sheetsConfig.source_sheet}` : 'todas as abas') : '—'}
+              <span className={`chevron ${sheetsOpen ? 'open' : ''}`}>▾</span>
+            </span>
+          </button>
+
+          {sheetsOpen && sheetsConfig && (
+            <div className="sources-body">
+              <p className="hint">Aponta de qual Google Sheet o sistema lê e escreve. Trocar aqui muda scraper, outreach e o bot.</p>
+
+              <label className="field">
+                <span>Spreadsheet ID (ou URL completa)</span>
+                <input
+                  type="text"
+                  value={sheetsConfig.spreadsheet_id || ''}
+                  onChange={(e) => updateSheetsField('spreadsheet_id', e.target.value)}
+                  placeholder="1QRnMXp8lTm..."
+                />
+              </label>
+
+              <div className="outreach-grid">
+                <label>
+                  Aba de saída do scraper
+                  <input
+                    type="text"
+                    value={sheetsConfig.output_sheet_name || ''}
+                    onChange={(e) => updateSheetsField('output_sheet_name', e.target.value)}
+                    placeholder="Leads_OAB_Scraper"
+                  />
+                </label>
+                <label>
+                  Seccional
+                  <input
+                    type="text"
+                    value={sheetsConfig.seccional || ''}
+                    onChange={(e) => updateSheetsField('seccional', e.target.value)}
+                    placeholder="Santa Catarina"
+                  />
+                </label>
+                <label>
+                  Aba fonte do disparo (vazio = todas)
+                  <input
+                    type="text"
+                    value={sheetsConfig.source_sheet || ''}
+                    onChange={(e) => updateSheetsField('source_sheet', e.target.value)}
+                    placeholder="(opcional)"
+                  />
+                </label>
+              </div>
+
+              <div className="sources-actions">
+                <button className="btn-secondary" onClick={loadSheetsConfig} disabled={sheetsSaving}>
+                  Recarregar
+                </button>
+                <button
+                  className="btn-primary"
+                  onClick={saveSheetsConfig}
+                  disabled={!sheetsDirty || sheetsSaving}
+                >
+                  {sheetsSaving ? 'Salvando…' : sheetsDirty ? 'Salvar' : 'Salvo'}
+                </button>
+              </div>
             </div>
           )}
         </section>

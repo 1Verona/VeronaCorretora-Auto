@@ -12,6 +12,7 @@ from typing import Any, Callable
 import pytz
 from dotenv import load_dotenv
 
+from agent_config import active_tools, load_config as load_agent_config
 from evolution_client import EvolutionClient, EvolutionError, jid_to_phone, normalize_phone
 from sheet_manager import SheetManager
 
@@ -20,9 +21,6 @@ load_dotenv(Path(__file__).parent / ".env")
 BASE_DIR = Path(__file__).resolve().parent
 CONVERSATIONS_PATH = BASE_DIR / "conversations.json"
 TZ = pytz.timezone(os.getenv("TZ", "America/Sao_Paulo"))
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-HISTORY_LIMIT = 20
 
 STAGES = {
     "NEW",
@@ -35,118 +33,6 @@ STAGES = {
     "NOT_INTERESTED",
     "HUMAN_TAKEOVER",
 }
-
-SYSTEM_PROMPT = """Você é Ana, consultora da Verona Corretora — uma corretora especializada em seguros para advogados.
-
-Seu papel é conversar com leads (advogados) que receberam uma primeira mensagem nossa pelo WhatsApp. Você deve:
-
-1. Manter tom **cordial, direto e profissional**, em português brasileiro. Mensagens curtas (1-3 frases).
-2. Apresentar brevemente o benefício de seguros (vida, profissional, saúde) para a rotina do advogado, sem ser invasiva.
-3. **Detectar interesse em agendar uma reunião** — sinais: "podemos marcar", "tenho interesse", "quero saber mais", "vamos conversar", "quando podemos falar".
-4. Quando identificar interesse, coletar os dados necessários em ordem (1 pergunta por vez): nome completo → melhor data/horário (oferecer sugestões em horário comercial) → email para enviar o convite.
-5. **Detectar desinteresse** — sinais: "não tenho interesse", "não quero", "já tenho", "para de mandar", silêncio explícito, xingamento.
-6. **Nunca insistir** se o lead recusar. Agradeça e encerre.
-7. Se o lead pedir falar com humano / fazer pergunta técnica fora do seu escopo, sinalize human_takeover.
-
-Você tem acesso às ferramentas:
-- `responder` — devolver uma mensagem ao lead.
-- `coletar_dado` — solicitar/registrar um dado específico (nome_completo, data_hora, email).
-- `agendar` — finalizar agendamento quando tiver TODOS os dados.
-- `marcar_sem_interesse` — encerrar conversa com motivo.
-- `pedir_humano` — quando o lead precisar de atendimento humano.
-
-Use SEMPRE function-calling. Não responda em texto puro.
-"""
-
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "responder",
-            "description": "Envia uma resposta de texto ao lead, mantendo a conversa engajada sem ainda coletar dados.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mensagem": {"type": "string", "description": "Texto curto para o lead."},
-                    "novo_estagio": {
-                        "type": "string",
-                        "enum": ["ENGAGED", "COLLECTING_NAME", "COLLECTING_DATETIME", "COLLECTING_EMAIL"],
-                        "description": "Estágio para onde a conversa avança após esta mensagem.",
-                    },
-                },
-                "required": ["mensagem", "novo_estagio"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "coletar_dado",
-            "description": "Registra um dado fornecido pelo lead e responde confirmando + perguntando o próximo dado.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "campo": {"type": "string", "enum": ["nome_completo", "data_hora", "email"]},
-                    "valor": {"type": "string"},
-                    "mensagem": {"type": "string", "description": "Resposta ao lead após coletar."},
-                    "novo_estagio": {
-                        "type": "string",
-                        "enum": ["COLLECTING_NAME", "COLLECTING_DATETIME", "COLLECTING_EMAIL", "AWAITING_CONFIRMATION"],
-                    },
-                },
-                "required": ["campo", "valor", "mensagem", "novo_estagio"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "agendar",
-            "description": "Cria o evento no Calendar (TODOS os dados precisam estar coletados) e responde ao lead confirmando.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "nome_completo": {"type": "string"},
-                    "data_hora_iso": {"type": "string", "description": "Data/hora local em ISO 8601, ex: 2026-05-15T14:00"},
-                    "email": {"type": "string"},
-                    "mensagem_confirmacao": {"type": "string"},
-                },
-                "required": ["nome_completo", "data_hora_iso", "email", "mensagem_confirmacao"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "marcar_sem_interesse",
-            "description": "Encerra a conversa marcando o lead como sem interesse.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "motivo": {"type": "string"},
-                    "mensagem_despedida": {"type": "string"},
-                },
-                "required": ["motivo", "mensagem_despedida"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "pedir_humano",
-            "description": "Sinaliza que o corretor humano precisa assumir.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "motivo": {"type": "string"},
-                    "mensagem_lead": {"type": "string"},
-                },
-                "required": ["motivo", "mensagem_lead"],
-            },
-        },
-    },
-]
-
 
 _lock = threading.Lock()
 _evolution = EvolutionClient()
@@ -188,10 +74,18 @@ def _upsert(phone: str, conv: dict[str, Any]) -> None:
         _save_all(data)
 
 
+def _history_limit() -> int:
+    try:
+        return int(load_agent_config().get("history_limit", 20))
+    except Exception:
+        return 20
+
+
 def _append_history(conv: dict[str, Any], role: str, content: str) -> None:
     conv.setdefault("history", []).append({"role": role, "content": content, "ts": time.time()})
-    if len(conv["history"]) > HISTORY_LIMIT:
-        conv["history"] = conv["history"][-HISTORY_LIMIT:]
+    limit = _history_limit()
+    if len(conv["history"]) > limit:
+        conv["history"] = conv["history"][-limit:]
 
 
 def register_outbound_first_contact(lead: dict[str, Any]) -> None:
@@ -321,11 +215,13 @@ def handle_inbound_payload(
 
 def _llm_decide(conv: dict[str, Any], inbound_text: str) -> dict[str, Any]:
     client = _client()
+    cfg = load_agent_config()
+    history_limit = int(cfg.get("history_limit", 20))
     messages = [
         {
             "role": "system",
             "content": (
-                f"{SYSTEM_PROMPT}\n\n"
+                f"{cfg.get('system_prompt', '')}\n\n"
                 f"Estágio atual: {conv.get('stage', 'ENGAGED')}\n"
                 f"Dados já coletados: {json.dumps(conv.get('collected', {}), ensure_ascii=False)}\n"
                 f"Nome conhecido na planilha: {conv.get('nome', '(desconhecido)')}\n"
@@ -333,18 +229,18 @@ def _llm_decide(conv: dict[str, Any], inbound_text: str) -> dict[str, Any]:
             ),
         }
     ]
-    for entry in (conv.get("history") or [])[-HISTORY_LIMIT:]:
+    for entry in (conv.get("history") or [])[-history_limit:]:
         role = entry.get("role", "user")
         if role not in ("user", "assistant"):
             role = "user"
         messages.append({"role": role, "content": entry.get("content", "")})
 
     response = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=cfg.get("model", "gpt-4o-mini"),
         messages=messages,
-        tools=TOOLS,
+        tools=active_tools(),
         tool_choice="auto",
-        temperature=0.4,
+        temperature=float(cfg.get("temperature", 0.4)),
     )
     choice = response.choices[0].message
     tool_calls = choice.tool_calls or []
