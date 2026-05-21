@@ -542,14 +542,24 @@ export default function App() {
           </div>
         )}
 
-        <section className="sources">
+        <div className="cards">
+        <section className={`sources ${sourcesOpen ? 'open' : ''}`}>
           <button
             className="sources-header"
             onClick={() => setSourcesOpen((v) => !v)}
           >
-            <span className="sources-title">Fontes de leads</span>
+            <span className="sources-title-group">
+              <span className="sources-icon">📋</span>
+              <span className="sources-title">Fontes de leads</span>
+            </span>
             <span className="sources-summary">
-              {sources.length === 0 ? '—' : `${enabledCount}/${sources.length} ativas`}
+              {sources.length === 0 ? (
+                <span className="status-pill off">sem abas</span>
+              ) : (
+                <span className={`status-pill ${enabledCount > 0 ? 'on' : 'off'}`}>
+                  {enabledCount}/{sources.length} ativas
+                </span>
+              )}
               <span className={`chevron ${sourcesOpen ? 'open' : ''}`}>▾</span>
             </span>
           </button>
@@ -606,15 +616,22 @@ export default function App() {
           )}
         </section>
 
-        <section className="sources">
+        <section className={`sources ${outreachOpen ? 'open' : ''}`}>
           <button
             className="sources-header"
             onClick={() => setOutreachOpen((v) => !v)}
           >
-            <span className="sources-title">Disparo WhatsApp</span>
+            <span className="sources-title-group">
+              <span className="sources-icon">💬</span>
+              <span className="sources-title">Disparo WhatsApp</span>
+            </span>
             <span className="sources-summary">
-              {outreachConfig?.enabled ? '🟢 ligado' : '🔴 desligado'}
-              {outreachStatus?.queue_size != null && ` · fila ${outreachStatus.queue_size}`}
+              <span className={`status-pill ${outreachConfig?.enabled ? 'on' : 'off'}`}>
+                {outreachConfig?.enabled ? 'ligado' : 'desligado'}
+              </span>
+              {outreachStatus?.queue_size != null && outreachStatus.queue_size >= 0 && (
+                <span className="status-pill info">fila {outreachStatus.queue_size}</span>
+              )}
               <span className={`chevron ${outreachOpen ? 'open' : ''}`}>▾</span>
             </span>
           </button>
@@ -772,14 +789,26 @@ export default function App() {
           )}
         </section>
 
-        <section className="sources">
+        <section className={`sources ${agentOpen ? 'open' : ''}`}>
           <button
             className="sources-header"
             onClick={() => setAgentOpen((v) => !v)}
           >
-            <span className="sources-title">Identidade do agente</span>
+            <span className="sources-title-group">
+              <span className="sources-icon">🤖</span>
+              <span className="sources-title">Identidade do agente</span>
+            </span>
             <span className="sources-summary">
-              {agentConfig ? `${agentConfig.model} · ${(agentTools.filter((t) => t.enabled).length)}/${agentTools.length} funções` : '—'}
+              {agentConfig ? (
+                <>
+                  <span className="status-pill info">{agentConfig.model}</span>
+                  <span className="status-pill on">
+                    {agentTools.filter((t) => t.enabled).length}/{agentTools.length} funções
+                  </span>
+                </>
+              ) : (
+                <span className="status-pill off">—</span>
+              )}
               <span className={`chevron ${agentOpen ? 'open' : ''}`}>▾</span>
             </span>
           </button>
@@ -869,14 +898,19 @@ export default function App() {
           )}
         </section>
 
-        <section className="sources">
+        <section className={`sources ${sheetsOpen ? 'open' : ''}`}>
           <button
             className="sources-header"
             onClick={() => setSheetsOpen((v) => !v)}
           >
-            <span className="sources-title">Planilha de leads</span>
+            <span className="sources-title-group">
+              <span className="sources-icon">📊</span>
+              <span className="sources-title">Planilha de leads</span>
+            </span>
             <span className="sources-summary">
-              {sheetsConfig ? (sheetsConfig.source_sheet ? `aba: ${sheetsConfig.source_sheet}` : 'todas as abas') : '—'}
+              <span className="status-pill info">
+                {sheetsConfig ? (sheetsConfig.source_sheet ? `aba: ${sheetsConfig.source_sheet}` : 'todas as abas') : '—'}
+              </span>
               <span className={`chevron ${sheetsOpen ? 'open' : ''}`}>▾</span>
             </span>
           </button>
@@ -940,6 +974,7 @@ export default function App() {
             </div>
           )}
         </section>
+        </div>
       </main>
     </div>
   )
