@@ -29,6 +29,7 @@ export default defineConfig({
       '/connect': backendUrl,
       '/health': backendUrl,
       '/sources': backendUrl,
+      '/leadgen': backendUrl,
       '/outreach': backendUrl,
       '/agent': backendUrl,
       '/sheets': backendUrl,

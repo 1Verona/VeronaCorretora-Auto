@@ -15,6 +15,8 @@ from flask import Flask, jsonify, request
 from googleapiclient.errors import HttpError
 
 from agent_config import load_config as load_agent_cfg, save_config as save_agent_cfg, tools_catalog
+from lead_gen_worker import LeadGenWorker
+from lead_gen_worker import load_config as load_leadgen_config, save_config as save_leadgen_config
 from outreach_worker import OutreachWorker, load_config, save_config
 from scraper import (
     DEFAULT_CREDENTIALS_PATH,
@@ -211,6 +213,7 @@ outreach_worker = OutreachWorker(
     notify_broker=_notify_broker,
     conversation_hook=_conversation_seed,
 )
+lead_gen_worker = LeadGenWorker(notify_broker=_notify_broker)
 
 
 def build_config_from_request(form) -> ScraperConfig:
@@ -383,6 +386,35 @@ def update_sources():
     return jsonify({"ok": True, "config": config})
 
 
+@app.get("/leadgen/status")
+def leadgen_status():
+    return jsonify(lead_gen_worker.status())
+
+
+@app.post("/leadgen/config")
+def leadgen_set_config():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Formato inválido"}), 400
+    try:
+        merged = {**load_leadgen_config(), **payload}
+        if "interval_hours" in merged:
+            merged["interval_hours"] = int(merged["interval_hours"])
+        saved = save_leadgen_config(merged)
+        return jsonify({"ok": True, "config": saved})
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": f"Valor inválido: {exc}"}), 400
+
+
+@app.post("/leadgen/run-now")
+def leadgen_run_now():
+    def _runner():
+        lead_gen_worker.run_now()
+
+    threading.Thread(target=_runner, daemon=True).start()
+    return jsonify({"ok": True, "message": "Busca de novos leads iniciada em background."})
+
+
 @app.get("/health")
 def healthcheck():
     state = job_manager.get_state()
@@ -523,7 +555,8 @@ def sheets_set_config():
 
 
 @app.post("/webhook/evolution")
-def evolution_webhook():
+@app.post("/webhook/evolution/<event>")
+def evolution_webhook(event=None):
     expected_token = os.getenv("EVOLUTION_WEBHOOK_TOKEN", "").strip()
     if expected_token:
         auth = request.headers.get("Authorization", "")
@@ -537,10 +570,15 @@ def evolution_webhook():
             return jsonify({"error": "unauthorized"}), 401
 
     payload = request.get_json(silent=True) or {}
+    import json as _json
+    print(f"[WEBHOOK DEBUG] event={event}")
+    print(f"[WEBHOOK DEBUG] payload keys: {list(payload.keys())}")
+    print(f"[WEBHOOK DEBUG] payload (truncated): {_json.dumps(payload, ensure_ascii=False)[:1000]}")
     try:
         from conversation_engine import handle_inbound_payload
 
         result = handle_inbound_payload(payload, notify_broker=_notify_broker)
+        print(f"[WEBHOOK DEBUG] result: {result}")
         return jsonify({"ok": True, "result": result})
     except Exception as exc:
         traceback.print_exc()
@@ -560,6 +598,7 @@ if __name__ == "__main__":
     flask_thread.start()
 
     outreach_worker.start()
+    lead_gen_worker.start()
 
     if not TELEGRAM_BOT_TOKEN:
         print(" * AVISO: TELEGRAM_BOT_TOKEN não definido no .env — bot do Telegram desligado.")

@@ -13,7 +13,7 @@ import pytz
 from dotenv import load_dotenv
 
 from agent_config import active_tools, load_config as load_agent_config
-from evolution_client import EvolutionClient, EvolutionError, jid_to_phone, normalize_phone
+from evolution_client import EvolutionClient, EvolutionError, jid_to_phone, normalize_phone, phone_variants
 from sheet_manager import SheetManager
 
 load_dotenv(Path(__file__).parent / ".env")
@@ -183,12 +183,15 @@ def handle_inbound_payload(
     agent_cfg = load_agent_config()
     if agent_cfg.get("test_mode"):
         test_phone = normalize_phone(agent_cfg.get("test_phone") or "")
-        if not test_phone or phone != test_phone:
+        if not test_phone or not (phone_variants(phone) & phone_variants(test_phone)):
             return {"ignored": True, "reason": "test_mode", "test_phone": test_phone}
 
     conv = _get(phone)
     if not conv:
-        lead = _sheets.find_lead_by_phone(phone)
+        try:
+            lead = _sheets.find_lead_by_phone(phone)
+        except Exception:
+            lead = None
         conv = {
             "phone": phone,
             "nome": (lead or {}).get("nome", ""),
