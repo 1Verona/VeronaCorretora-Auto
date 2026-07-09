@@ -125,6 +125,8 @@ class EvolutionClient:
         number = normalize_phone(phone)
         if not number:
             raise EvolutionError(0, f"telefone inválido: {phone!r}")
+        if not (text or "").strip():
+            raise EvolutionError(0, "mensagem vazia — abortando envio para não mandar mensagem em branco")
         payload = {"number": number, "text": text}
         return self._post(f"/message/sendText/{self.instance_path}", payload)
 
@@ -143,3 +145,41 @@ class EvolutionClient:
 
     def instance_status(self) -> dict[str, Any]:
         return self._get(f"/instance/connectionState/{self.instance_path}")
+
+    def is_connected(self) -> bool:
+        """Retorna True se a instância está conectada (state == open)."""
+        try:
+            data = self.instance_status()
+            # A Evolution pode retornar {instance: {state: 'open'}} ou {state: 'open'}
+            state = (
+                (data.get("instance") or {}).get("state")
+                or data.get("state")
+                or ""
+            )
+            return state.lower() == "open"
+        except Exception:
+            return False
+
+    def get_qr_code(self) -> dict[str, Any]:
+        """Tenta obter o QR code da instância. Retorna {connected, qr_base64}."""
+        if not self.configured:
+            return {"connected": False, "qr_base64": None, "error": "Evolution não configurado"}
+        try:
+            # Primeiro verifica o estado atual
+            if self.is_connected():
+                return {"connected": True, "qr_base64": None}
+            # Solicita o QR code
+            data = self._get(f"/instance/connect/{self.instance_path}")
+            # A Evolution retorna {base64: "data:image/png;base64,..."} ou {qrcode: {base64: ...}}
+            qr = (
+                data.get("base64")
+                or (data.get("qrcode") or {}).get("base64")
+                or (data.get("qrCode") or {}).get("base64")
+                or ""
+            )
+            # Remove o prefixo data URI se presente
+            if qr and "," in qr:
+                qr = qr.split(",", 1)[1]
+            return {"connected": False, "qr_base64": qr or None}
+        except EvolutionError as exc:
+            return {"connected": False, "qr_base64": None, "error": str(exc)}

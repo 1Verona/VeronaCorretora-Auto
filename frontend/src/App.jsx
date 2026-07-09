@@ -9,7 +9,94 @@ const STATUS_LABELS = {
   failed: 'Erro',
 }
 
+const TOKEN_KEY = 'verona_auth_token'
+
+async function apiFetch(url, options = {}) {
+  const token = localStorage.getItem(TOKEN_KEY) || ''
+  const headers = { ...(options.headers || {}) }
+  if (token) headers['Authorization'] = `Bearer ${token}`
+  const res = await fetch(url, { ...options, headers })
+  if (res.status === 401) {
+    localStorage.removeItem(TOKEN_KEY)
+    window.location.reload()
+  }
+  return res
+}
+
+function LoginScreen({ onLogin }) {
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(false)
+
+  const handleSubmit = async (e) => {
+    e.preventDefault()
+    setError('')
+    setLoading(true)
+    try {
+      const res = await fetch('/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      })
+      const data = await res.json()
+      if (data.ok && data.token) {
+        localStorage.setItem(TOKEN_KEY, data.token)
+        onLogin(data.token)
+      } else {
+        setError(data.error || 'Credenciais inválidas')
+      }
+    } catch {
+      setError('Erro de conexão com o servidor')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="login-wrapper">
+      <div className="login-card">
+        <div className="login-logo">
+          <span className="login-dot" />
+          <span className="login-brand">Verona</span>
+        </div>
+        <p className="login-subtitle">Painel de Controle</p>
+        <form className="login-form" onSubmit={handleSubmit}>
+          <label className="login-field">
+            <span>Usuário</span>
+            <input
+              type="text"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder="Admin"
+              autoComplete="username"
+              autoFocus
+              required
+            />
+          </label>
+          <label className="login-field">
+            <span>Senha</span>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="••••••••"
+              autoComplete="current-password"
+              required
+            />
+          </label>
+          {error && <p className="login-error">{error}</p>}
+          <button type="submit" className="login-btn" disabled={loading}>
+            {loading ? 'Entrando…' : 'Entrar'}
+          </button>
+        </form>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
+  const [authToken, setAuthToken] = useState(() => localStorage.getItem(TOKEN_KEY) || '')
   const [connected, setConnected] = useState(null)
   const [active, setActive] = useState(false)
   const [captcha, setCaptcha] = useState(false)
@@ -38,12 +125,20 @@ export default function App() {
   const [sheetsConfig, setSheetsConfig] = useState(null)
   const [sheetsDirty, setSheetsDirty] = useState(false)
   const [sheetsSaving, setSheetsSaving] = useState(false)
+  const [evolutionOpen, setEvolutionOpen] = useState(false)
+  const [evolutionConfig, setEvolutionConfig] = useState(null)
+  const [evolutionDirty, setEvolutionDirty] = useState(false)
+  const [evolutionSaving, setEvolutionSaving] = useState(false)
+  const [evolutionStatus, setEvolutionStatus] = useState(null) // {connected, qr_base64, error}
+  const [evolutionQrPolling, setEvolutionQrPolling] = useState(false)
   const pollRef = useRef(null)
   const logsRef = useRef(null)
   const outreachPollRef = useRef(null)
+  const evolutionQrPollRef = useRef(null)
 
   useEffect(() => {
-    fetch('/status')
+    if (!authToken) return
+    apiFetch('/status')
       .then((r) => r.json())
       .then((data) => {
         setConnected(data.connected)
@@ -53,18 +148,18 @@ export default function App() {
       })
       .catch(() => setConnected(false))
 
-    fetch('/job')
+    apiFetch('/job')
       .then((r) => r.json())
       .then((data) => {
         const job = data.job || data.last_job
         if (job) applyJob(job)
       })
       .catch(() => {})
-  }, [])
+  }, [authToken])
 
   const loadSources = useCallback(async () => {
     try {
-      const res = await fetch('/sources')
+      const res = await apiFetch('/sources')
       const data = await res.json()
       if (Array.isArray(data.sources)) {
         setSources(data.sources)
@@ -110,7 +205,7 @@ export default function App() {
     if (pollRef.current) clearInterval(pollRef.current)
     pollRef.current = setInterval(async () => {
       try {
-        const res = await fetch('/job')
+        const res = await apiFetch('/job')
         const data = await res.json()
         const job = data.job || data.last_job
         if (job) applyJob(job)
@@ -133,7 +228,7 @@ export default function App() {
 
     if (active) {
       try {
-        await fetch('/stop', { method: 'POST' })
+        await apiFetch('/stop', { method: 'POST' })
         setActive(false)
         setCaptcha(false)
         setStatus('stopped')
@@ -146,7 +241,7 @@ export default function App() {
       }
     } else {
       try {
-        const res = await fetch('/run', { method: 'POST' })
+        const res = await apiFetch('/run', { method: 'POST' })
         const data = await res.json()
         if (data.error) {
           setError(data.error)
@@ -199,7 +294,7 @@ export default function App() {
   const saveSources = async () => {
     setSourcesSaving(true)
     try {
-      const res = await fetch('/sources', {
+      const res = await apiFetch('/sources', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sources }),
@@ -219,7 +314,7 @@ export default function App() {
 
   const loadOutreachConfig = useCallback(async () => {
     try {
-      const res = await fetch('/outreach/config')
+      const res = await apiFetch('/outreach/config')
       const data = await res.json()
       setOutreachConfig(data)
       setOutreachDirty(false)
@@ -229,8 +324,8 @@ export default function App() {
   const loadOutreachStatus = useCallback(async () => {
     try {
       const [statusRes, convRes] = await Promise.all([
-        fetch('/outreach/status').then((r) => r.json()),
-        fetch('/outreach/conversations').then((r) => r.json()),
+        apiFetch('/outreach/status').then((r) => r.json()),
+        apiFetch('/outreach/conversations').then((r) => r.json()),
       ])
       setOutreachStatus(statusRes)
       setConversations(convRes.conversations || [])
@@ -290,7 +385,7 @@ export default function App() {
     if (!outreachConfig) return
     setOutreachSaving(true)
     try {
-      const res = await fetch('/outreach/config', {
+      const res = await apiFetch('/outreach/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(outreachConfig),
@@ -299,7 +394,11 @@ export default function App() {
       if (data.config) {
         setOutreachConfig(data.config)
         setOutreachDirty(false)
+      } else if (data.error) {
+        setError(data.error)
       }
+    } catch {
+      setError('Falha ao salvar configuração de disparo')
     } finally {
       setOutreachSaving(false)
     }
@@ -317,7 +416,7 @@ export default function App() {
 
   const dispatchNow = async () => {
     try {
-      await fetch('/outreach/dispatch-now', { method: 'POST' })
+      await apiFetch('/outreach/dispatch-now', { method: 'POST' })
       loadOutreachStatus()
     } catch {}
   }
@@ -333,8 +432,8 @@ export default function App() {
   const loadAgentConfig = useCallback(async () => {
     try {
       const [cfgRes, toolsRes] = await Promise.all([
-        fetch('/agent/config').then((r) => r.json()),
-        fetch('/agent/tools').then((r) => r.json()),
+        apiFetch('/agent/config').then((r) => r.json()),
+        apiFetch('/agent/tools').then((r) => r.json()),
       ])
       setAgentConfig(cfgRes)
       setAgentTools(toolsRes.tools || [])
@@ -367,7 +466,7 @@ export default function App() {
     if (!agentConfig) return
     setAgentSaving(true)
     try {
-      const res = await fetch('/agent/config', {
+      const res = await apiFetch('/agent/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(agentConfig),
@@ -376,7 +475,7 @@ export default function App() {
       if (data.config) {
         setAgentConfig(data.config)
         setAgentDirty(false)
-        const toolsRes = await fetch('/agent/tools').then((r) => r.json())
+        const toolsRes = await apiFetch('/agent/tools').then((r) => r.json())
         setAgentTools(toolsRes.tools || [])
       } else if (data.error) {
         setError(data.error)
@@ -390,7 +489,7 @@ export default function App() {
 
   const loadSheetsConfig = useCallback(async () => {
     try {
-      const data = await fetch('/sheets/config').then((r) => r.json())
+      const data = await apiFetch('/sheets/config').then((r) => r.json())
       setSheetsConfig(data)
       setSheetsDirty(false)
     } catch {}
@@ -409,7 +508,7 @@ export default function App() {
     if (!sheetsConfig) return
     setSheetsSaving(true)
     try {
-      const res = await fetch('/sheets/config', {
+      const res = await apiFetch('/sheets/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(sheetsConfig),
@@ -427,6 +526,104 @@ export default function App() {
     } finally {
       setSheetsSaving(false)
     }
+  }
+
+  // ---- Evolution config ----
+  const loadEvolutionConfig = useCallback(async () => {
+    try {
+      const data = await apiFetch('/evolution/config').then((r) => r.json())
+      setEvolutionConfig({
+        evolution_api_url: data.evolution_api_url || '',
+        evolution_api_key: data.evolution_api_key_set ? '***SALVA***' : '',
+        evolution_api_key_masked: data.evolution_api_key_masked || '',
+        evolution_api_key_set: data.evolution_api_key_set || false,
+        evolution_instance: data.evolution_instance || '',
+        evolution_webhook_token: data.evolution_webhook_token || '',
+        configured: data.configured || false,
+      })
+      setEvolutionDirty(false)
+    } catch {}
+  }, [])
+
+  useEffect(() => {
+    if (connected && evolutionOpen && !evolutionConfig) loadEvolutionConfig()
+  }, [connected, evolutionOpen, evolutionConfig, loadEvolutionConfig])
+
+  const updateEvolutionField = (field, value) => {
+    setEvolutionConfig((prev) => ({ ...(prev || {}), [field]: value }))
+    setEvolutionDirty(true)
+  }
+
+  const saveEvolutionConfig = async () => {
+    if (!evolutionConfig) return
+    setEvolutionSaving(true)
+    try {
+      const body = {
+        evolution_api_url: evolutionConfig.evolution_api_url,
+        evolution_instance: evolutionConfig.evolution_instance,
+        evolution_webhook_token: evolutionConfig.evolution_webhook_token,
+      }
+      // Só envia a key se o usuário digitou uma nova (não o placeholder)
+      if (evolutionConfig.evolution_api_key && !evolutionConfig.evolution_api_key.includes('***')) {
+        body.evolution_api_key = evolutionConfig.evolution_api_key
+      }
+      const res = await apiFetch('/evolution/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const data = await res.json()
+      if (data.ok) {
+        setEvolutionDirty(false)
+        await loadEvolutionConfig()
+      } else {
+        setError(data.error || 'Falha ao salvar configurações')
+      }
+    } catch {
+      setError('Falha ao salvar Evolution')
+    } finally {
+      setEvolutionSaving(false)
+    }
+  }
+
+  const checkEvolutionQr = useCallback(async () => {
+    try {
+      const data = await apiFetch('/evolution/qr').then((r) => r.json())
+      setEvolutionStatus(data)
+      if (data.connected) {
+        setEvolutionQrPolling(false)
+        if (evolutionQrPollRef.current) {
+          clearInterval(evolutionQrPollRef.current)
+          evolutionQrPollRef.current = null
+        }
+        await loadEvolutionConfig()
+      }
+    } catch {}
+  }, [loadEvolutionConfig])
+
+  const startEvolutionQrPolling = useCallback(() => {
+    setEvolutionQrPolling(true)
+    checkEvolutionQr()
+    if (evolutionQrPollRef.current) clearInterval(evolutionQrPollRef.current)
+    evolutionQrPollRef.current = setInterval(checkEvolutionQr, 4000)
+  }, [checkEvolutionQr])
+
+  useEffect(() => {
+    if (!evolutionOpen) {
+      setEvolutionQrPolling(false)
+      setEvolutionStatus(null)
+      if (evolutionQrPollRef.current) {
+        clearInterval(evolutionQrPollRef.current)
+        evolutionQrPollRef.current = null
+      }
+    }
+    return () => {
+      if (evolutionQrPollRef.current) clearInterval(evolutionQrPollRef.current)
+    }
+  }, [evolutionOpen])
+
+  if (!authToken) {
+    return <LoginScreen onLogin={(token) => setAuthToken(token)} />
   }
 
   if (connected === null) {
@@ -459,7 +656,17 @@ export default function App() {
 
   return (
     <div className="app">
-      <header>
+      <header style={{ position: 'relative', width: '100%' }}>
+        <button
+          className="btn-secondary small"
+          style={{ position: 'absolute', right: 0, top: 0, padding: '6px 12px', fontSize: '11px', height: 'auto', border: '1px solid #222' }}
+          onClick={() => {
+            localStorage.removeItem(TOKEN_KEY)
+            setAuthToken('')
+          }}
+        >
+          Sair
+        </button>
         <h1>OABPrev</h1>
         <span className="subtitle">Busca de telefones</span>
       </header>
@@ -1002,6 +1209,165 @@ export default function App() {
                   {sheetsSaving ? 'Salvando…' : sheetsDirty ? 'Salvar' : 'Salvo'}
                 </button>
               </div>
+            </div>
+          )}
+        </section>
+
+        <section className={`sources ${evolutionOpen ? 'open' : ''}`}>
+          <button
+            className="sources-header"
+            onClick={() => setEvolutionOpen((v) => !v)}
+          >
+            <span className="sources-title-group">
+              <span className="sources-icon">📱</span>
+              <span className="sources-title">WhatsApp / Evolution</span>
+            </span>
+            <span className="sources-summary">
+              {evolutionConfig ? (
+                <>
+                  <span className={`status-pill ${evolutionConfig.configured ? 'on' : 'off'}`}>
+                    {evolutionConfig.configured ? 'configurado' : 'não configurado'}
+                  </span>
+                  {evolutionConfig.evolution_instance && (
+                    <span className="status-pill info">{evolutionConfig.evolution_instance}</span>
+                  )}
+                </>
+              ) : (
+                <span className="status-pill off">—</span>
+              )}
+              <span className={`chevron ${evolutionOpen ? 'open' : ''}`}>▾</span>
+            </span>
+          </button>
+
+          {evolutionOpen && (
+            <div className="sources-body">
+              {!evolutionConfig ? (
+                <p className="muted small">Carregando…</p>
+              ) : (
+                <>
+                  <p className="hint">
+                    Configure as credenciais da sua instância Evolution API. As chaves são salvas no servidor — o cliente não precisa tocar nos arquivos.
+                  </p>
+
+                  <label className="field">
+                    <span>URL da Evolution API</span>
+                    <input
+                      type="text"
+                      value={evolutionConfig.evolution_api_url}
+                      onChange={(e) => updateEvolutionField('evolution_api_url', e.target.value)}
+                      placeholder="https://sua-evolution.exemplo.com"
+                    />
+                  </label>
+
+                  <label className="field">
+                    <span>
+                      API Key
+                      {evolutionConfig.evolution_api_key_set && (
+                        <span style={{ marginLeft: 6, color: '#22c55e', fontSize: 11 }}>✓ salva</span>
+                      )}
+                    </span>
+                    <input
+                      type="password"
+                      value={evolutionConfig.evolution_api_key}
+                      onChange={(e) => updateEvolutionField('evolution_api_key', e.target.value)}
+                      placeholder={evolutionConfig.evolution_api_key_set ? '••••••••• (deixe vazio para manter)' : 'Cole sua API Key aqui'}
+                      autoComplete="new-password"
+                    />
+                  </label>
+
+                  <div className="outreach-grid">
+                    <label>
+                      Instance Name
+                      <input
+                        type="text"
+                        value={evolutionConfig.evolution_instance}
+                        onChange={(e) => updateEvolutionField('evolution_instance', e.target.value)}
+                        placeholder="MinhaInstancia"
+                      />
+                    </label>
+                    <label>
+                      Webhook Token (segurança)
+                      <input
+                        type="text"
+                        value={evolutionConfig.evolution_webhook_token}
+                        onChange={(e) => updateEvolutionField('evolution_webhook_token', e.target.value)}
+                        placeholder="token secreto (opcional)"
+                      />
+                    </label>
+                  </div>
+
+                  <div className="sources-actions" style={{ marginBottom: 16 }}>
+                    <button className="btn-secondary" onClick={loadEvolutionConfig} disabled={evolutionSaving}>
+                      Recarregar
+                    </button>
+                    <button
+                      className="btn-primary"
+                      onClick={saveEvolutionConfig}
+                      disabled={!evolutionDirty || evolutionSaving}
+                    >
+                      {evolutionSaving ? 'Salvando…' : evolutionDirty ? 'Salvar' : 'Salvo'}
+                    </button>
+                  </div>
+
+                  {/* QR Code Section */}
+                  <div className="evolution-qr-section">
+                    <div className="evolution-qr-header">
+                      <span className="evolution-qr-title">Conexão WhatsApp</span>
+                      <button
+                        className="btn-secondary small"
+                        onClick={startEvolutionQrPolling}
+                        disabled={!evolutionConfig.configured || evolutionQrPolling}
+                      >
+                        {evolutionQrPolling ? '⏳ Aguardando…' : '🔄 Gerar QR Code'}
+                      </button>
+                    </div>
+
+                    {evolutionStatus && (
+                      <>
+                        {evolutionStatus.connected && (
+                          <div className="alert amber" style={{ marginTop: 8 }}>
+                            <span className="alert-badge" style={{ background: 'rgba(34,197,94,0.15)', color: '#22c55e' }}>✓</span>
+                            <span style={{ color: '#4ade80' }}>WhatsApp conectado! Instância pronta para enviar mensagens.</span>
+                          </div>
+                        )}
+                        {!evolutionStatus.connected && evolutionStatus.qr_base64 && (
+                          <div className="evolution-qr-box">
+                            <p className="hint" style={{ marginBottom: 10 }}>
+                              Abra o WhatsApp → Aparelhos Conectados → Conectar aparelho → escaneie o código abaixo:
+                            </p>
+                            <img
+                              className="evolution-qr-img"
+                              src={`data:image/png;base64,${evolutionStatus.qr_base64}`}
+                              alt="QR Code WhatsApp"
+                            />
+                            <p className="hint" style={{ marginTop: 8, color: '#f59e0b' }}>
+                              ⏳ Verificando conexão a cada 4 segundos…
+                            </p>
+                          </div>
+                        )}
+                        {!evolutionStatus.connected && !evolutionStatus.qr_base64 && evolutionStatus.error && (
+                          <div className="alert red" style={{ marginTop: 8 }}>
+                            <span className="alert-badge">ERRO</span>
+                            <span>{evolutionStatus.error}</span>
+                          </div>
+                        )}
+                        {!evolutionStatus.connected && !evolutionStatus.qr_base64 && !evolutionStatus.error && evolutionQrPolling && (
+                          <div className="alert amber" style={{ marginTop: 8 }}>
+                            <span className="alert-badge">QR</span>
+                            <span>Aguardando QR code da Evolution API…</span>
+                          </div>
+                        )}
+                      </>
+                    )}
+
+                    {!evolutionConfig.configured && (
+                      <p className="hint" style={{ color: '#f59e0b', marginTop: 8 }}>
+                        ⚠️ Preencha e salve URL, API Key e Instance antes de gerar o QR Code.
+                      </p>
+                    )}
+                  </div>
+                </>
+              )}
             </div>
           )}
         </section>

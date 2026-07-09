@@ -23,6 +23,7 @@ export default defineConfig({
     port: 3000,
     proxy: {
       '/status': backendUrl,
+      '/login': backendUrl,
       '/run': backendUrl,
       '/stop': backendUrl,
       '/job': backendUrl,
@@ -33,6 +34,7 @@ export default defineConfig({
       '/outreach': backendUrl,
       '/agent': backendUrl,
       '/sheets': backendUrl,
+      '/evolution': backendUrl,
       '/webhook': backendUrl,
     },
   },

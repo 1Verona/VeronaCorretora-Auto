@@ -9,4 +9,5 @@ node_modules/
 .DS_Store
 .flask_port
 .env
+*.log
 

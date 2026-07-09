@@ -78,6 +78,16 @@ def pick_template(templates: list[str]) -> str:
     return random.choice(pool)
 
 
+def render_template(template: str, nome: str) -> str:
+    """Aplica os placeholders do template de forma segura.
+    Usa replace() em vez de format() para não quebrar com placeholders inesperados.
+    Garante que nome vazio não gere vírgula solta (ex: 'Olá , tudo bem?').
+    """
+    first_name = (nome or "").strip().split()[0] if (nome or "").strip() else ""
+    display_name = first_name if first_name else "Prezado(a)"
+    return template.replace("{nome}", display_name)
+
+
 class OutreachWorker:
     def __init__(
         self,
@@ -100,6 +110,7 @@ class OutreachWorker:
         self._sent_date: date | None = None
         self._next_dispatch_at: float | None = None
         self._last_error: str = ""
+        self._queue_cache: tuple[float, int] | None = None  # (timestamp, queue_size)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -118,15 +129,22 @@ class OutreachWorker:
             self._refresh_daily_counter(now.date())
             queue_size = -1
             try:
-                source = (load_sheets_config().get("source_sheet") or "").strip() or None
-                agent_cfg = load_agent_config()
-                pool = self.sheet_manager.get_leads_pending_first_contact(source, limit=200)
-                if agent_cfg.get("test_mode"):
-                    test_phone = normalize_phone(agent_cfg.get("test_phone") or "")
-                    pool = [c for c in pool if normalize_phone(c.get("telefone", "")) == test_phone]
-                queue_size = len(pool)
+                # Cache de 30s para não bater a quota da Google Sheets a cada poll
+                cache_ttl = 30.0
+                if self._queue_cache and (time.time() - self._queue_cache[0]) < cache_ttl:
+                    queue_size = self._queue_cache[1]
+                else:
+                    source = (load_sheets_config().get("source_sheet") or "").strip() or None
+                    agent_cfg = load_agent_config()
+                    pool = self.sheet_manager.get_leads_pending_first_contact(source, limit=200)
+                    if agent_cfg.get("test_mode"):
+                        test_phone = normalize_phone(agent_cfg.get("test_phone") or "")
+                        pool = [c for c in pool if normalize_phone(c.get("telefone", "")) == test_phone]
+                    queue_size = len(pool)
+                    self._queue_cache = (time.time(), queue_size)
             except Exception:
                 queue_size = -1
+            agent_cfg = load_agent_config()
             next_dispatch = None
             if self._next_dispatch_at:
                 remaining = max(0, int(self._next_dispatch_at - time.time()))
@@ -223,7 +241,10 @@ class OutreachWorker:
 
         lead = candidates[0]
         template = pick_template(config.get("templates") or DEFAULT_TEMPLATES)
-        text = template.format(nome=lead["nome"].split()[0] if lead.get("nome") else "")
+        text = render_template(template, lead.get("nome", ""))
+
+        if not text.strip():
+            return {"sent": False, "error": "template resultou em mensagem vazia"}
 
         try:
             self.evolution.send_text(lead["telefone"], text)

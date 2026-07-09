@@ -153,6 +153,9 @@ def _extract_message_from_payload(payload: dict[str, Any]) -> tuple[str, str]:
     if key.get("fromMe"):
         return "", ""
     remote_jid = key.get("remoteJid") or data.get("remoteJid") or ""
+    # Ignorar mensagens de grupos (JID termina em @g.us)
+    if remote_jid.endswith("@g.us"):
+        return "", ""
     phone = jid_to_phone(remote_jid) if remote_jid else ""
     if not phone:
         phone = data.get("from") or payload.get("from") or ""
@@ -186,39 +189,45 @@ def handle_inbound_payload(
         if not test_phone or not (phone_variants(phone) & phone_variants(test_phone)):
             return {"ignored": True, "reason": "test_mode", "test_phone": test_phone}
 
-    conv = _get(phone)
-    if not conv:
-        try:
-            lead = _sheets.find_lead_by_phone(phone)
-        except Exception:
-            lead = None
-        conv = {
-            "phone": phone,
-            "nome": (lead or {}).get("nome", ""),
-            "sheet": (lead or {}).get("sheet", ""),
-            "row": (lead or {}).get("row"),
-            "stage": "ENGAGED" if lead else "NEW",
-            "collected": {},
-            "history": [],
-            "paused_by_broker": False,
-            "first_contact_at": None,
-            "last_inbound_ts": time.time(),
-            "last_outbound_ts": None,
-        }
+    # Fix #4: toda a leitura + escrita da conversa dentro do lock para evitar race condition
+    with _lock:
+        conv = _get(phone)
+        if not conv:
+            try:
+                lead = _sheets.find_lead_by_phone(phone)
+            except Exception:
+                lead = None
+            conv = {
+                "phone": phone,
+                "nome": (lead or {}).get("nome", ""),
+                "sheet": (lead or {}).get("sheet", ""),
+                "row": (lead or {}).get("row"),
+                "stage": "ENGAGED" if lead else "NEW",
+                "collected": {},
+                "history": [],
+                "paused_by_broker": False,
+                "first_contact_at": None,
+                "last_inbound_ts": time.time(),
+                "last_outbound_ts": None,
+            }
+
+        if conv.get("paused_by_broker"):
+            _append_history(conv, "user", text)
+            conv["last_inbound_ts"] = time.time()
+            _upsert(phone, conv)
 
     if conv.get("paused_by_broker"):
-        _append_history(conv, "user", text)
-        conv["last_inbound_ts"] = time.time()
-        _upsert(phone, conv)
         notify_broker(f"💬 Lead {conv.get('nome') or phone} respondeu (conversa pausada para humano):\n\n{text}")
         return {"paused": True}
 
-    _append_history(conv, "user", text)
-    conv["last_inbound_ts"] = time.time()
+    with _lock:
+        _append_history(conv, "user", text)
+        conv["last_inbound_ts"] = time.time()
 
     decision = _llm_decide(conv, text)
     result = _apply_decision(conv, decision, notify_broker)
-    _upsert(phone, conv)
+    with _lock:
+        _upsert(phone, conv)
     return result
 
 
@@ -250,6 +259,7 @@ def _llm_decide(conv: dict[str, Any], inbound_text: str) -> dict[str, Any]:
         tools=active_tools(),
         tool_choice="auto",
         temperature=float(cfg.get("temperature", 0.4)),
+        timeout=30,
     )
     choice = response.choices[0].message
     tool_calls = choice.tool_calls or []

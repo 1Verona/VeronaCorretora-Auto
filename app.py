@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac as _hmac
 import os
 import re
 import socket
@@ -42,6 +44,55 @@ from telegram_bot import TELEGRAM_BOT_TOKEN, TelegramBot
 BASE_DIR = Path(__file__).resolve().parent
 CREDENTIALS_PATH = DEFAULT_CREDENTIALS_PATH
 FLASK_PORT_FILE = BASE_DIR / ".flask_port"
+ENV_PATH = BASE_DIR / ".env"
+
+
+def _read_env_file() -> dict[str, str]:
+    """Lê o .env como dict preservando todas as linhas."""
+    if not ENV_PATH.exists():
+        return {}
+    result: dict[str, str] = {}
+    for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, val = stripped.partition("=")
+        result[key.strip()] = val.strip()
+    return result
+
+
+def _write_env_file(values: dict[str, str]) -> None:
+    """Reescreve o .env atualizando as chaves fornecidas (preserva ordem e comentários)."""
+    lines: list[str] = []
+    if ENV_PATH.exists():
+        lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
+
+    updated_keys: set[str] = set()
+    new_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#") or not stripped or "=" not in stripped:
+            new_lines.append(line)
+            continue
+        key = stripped.partition("=")[0].strip()
+        if key in values:
+            new_lines.append(f"{key}={values[key]}")
+            updated_keys.add(key)
+        else:
+            new_lines.append(line)
+
+    # Adiciona chaves novas que não existiam no arquivo
+    for key, val in values.items():
+        if key not in updated_keys:
+            new_lines.append(f"{key}={val}")
+
+    ENV_PATH.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+
+def _reload_evolution_client() -> None:
+    """Recria o EvolutionClient com os valores atuais do os.environ."""
+    from evolution_client import EvolutionClient
+    outreach_worker.evolution = EvolutionClient()
 
 
 def find_free_port(start: int = 5050, max_attempts: int = 10) -> int:
@@ -63,9 +114,63 @@ app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 @app.after_request
 def add_cors(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return response
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+_ADMIN_USER = os.getenv("ADMIN_USER", "Admin").strip()
+_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
+_APP_SECRET = os.getenv("APP_SECRET", "verona-dev-secret").strip()
+
+_AUTH_SKIP_PREFIXES = ("/webhook/",)
+_AUTH_SKIP_EXACT = {"/login"}
+
+
+def _make_token(user: str, pw: str) -> str:
+    msg = f"{user}:{pw}".encode()
+    return _hmac.new(_APP_SECRET.encode(), msg, hashlib.sha256).hexdigest()
+
+
+def _verify_token(token: str) -> bool:
+    if not _ADMIN_PASSWORD:
+        return True  # sem senha configurada = acesso livre (dev local)
+    expected = _make_token(_ADMIN_USER, _ADMIN_PASSWORD)
+    return _hmac.compare_digest(token, expected)
+
+
+@app.before_request
+def check_auth():
+    if request.method == "OPTIONS":
+        return None
+    path = request.path
+    if path in _AUTH_SKIP_EXACT or any(path.startswith(p) for p in _AUTH_SKIP_PREFIXES):
+        return None
+    if not _ADMIN_PASSWORD:
+        return None  # auth desativada localmente
+    auth = request.headers.get("Authorization", "")
+    token = ""
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+    if not token or not _verify_token(token):
+        return jsonify({"error": "Não autorizado", "auth_required": True}), 401
+    return None
+
+
+@app.post("/login")
+def login():
+    payload = request.get_json(silent=True) or {}
+    user = (payload.get("username") or "").strip()
+    pw = (payload.get("password") or "").strip()
+    if not _ADMIN_PASSWORD:
+        return jsonify({"ok": True, "token": "no-auth"})
+    if user == _ADMIN_USER and pw == _ADMIN_PASSWORD:
+        return jsonify({"ok": True, "token": _make_token(user, pw)})
+    return jsonify({"ok": False, "error": "Usuário ou senha incorretos"}), 401
 
 
 class JobManager:
@@ -552,6 +657,78 @@ def sheets_set_config():
         payload["spreadsheet_id"] = normalize_spreadsheet_id(payload.get("spreadsheet_id"))
     saved = save_sheets_cfg(payload)
     return jsonify({"ok": True, "config": saved})
+
+
+@app.get("/evolution/config")
+def evolution_get_config():
+    """Retorna as configura\u00e7\u00f5es atuais da Evolution (mascarando a API key)."""
+    env = _read_env_file()
+    api_key = env.get("EVOLUTION_API_KEY", "")
+    masked_key = (api_key[:6] + "***") if len(api_key) > 6 else ("***" if api_key else "")
+    from evolution_client import EvolutionClient
+    client = EvolutionClient()
+    return jsonify({
+        "evolution_api_url": env.get("EVOLUTION_API_URL", ""),
+        "evolution_api_key_set": bool(api_key),
+        "evolution_api_key_masked": masked_key,
+        "evolution_instance": env.get("EVOLUTION_INSTANCE", ""),
+        "evolution_webhook_token": env.get("EVOLUTION_WEBHOOK_TOKEN", ""),
+        "configured": client.configured,
+    })
+
+
+@app.post("/evolution/config")
+def evolution_set_config():
+    """Salva as credenciais da Evolution no .env e recarrega o cliente."""
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Formato inv\u00e1lido"}), 400
+
+    allowed = {"evolution_api_url", "evolution_api_key", "evolution_instance", "evolution_webhook_token"}
+    updates: dict[str, str] = {}
+
+    if "evolution_api_url" in payload:
+        url = str(payload["evolution_api_url"]).strip().rstrip("/")
+        updates["EVOLUTION_API_URL"] = url
+    if "evolution_api_key" in payload:
+        key = str(payload["evolution_api_key"]).strip()
+        if key and not key.endswith("***"):
+            updates["EVOLUTION_API_KEY"] = key
+    if "evolution_instance" in payload:
+        updates["EVOLUTION_INSTANCE"] = str(payload["evolution_instance"]).strip()
+    if "evolution_webhook_token" in payload:
+        updates["EVOLUTION_WEBHOOK_TOKEN"] = str(payload["evolution_webhook_token"]).strip()
+
+    if not updates:
+        return jsonify({"error": "Nenhum campo v\u00e1lido enviado"}), 400
+
+    # Salva no .env
+    _write_env_file(updates)
+    # Aplica no os.environ para o processo atual
+    for k, v in updates.items():
+        os.environ[k] = v
+
+    # Recarrega o EvolutionClient com as novas credenciais
+    try:
+        _reload_evolution_client()
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"Salvo no .env mas falha ao recarregar cliente: {exc}"}), 500
+
+    return jsonify({"ok": True, "message": "Credenciais salvas e aplicadas."})
+
+
+@app.get("/evolution/qr")
+def evolution_qr():
+    """Retorna QR code da inst\u00e2ncia Evolution para o cliente escanear no frontend."""
+    from evolution_client import EvolutionClient
+    client = EvolutionClient()
+    if not client.configured:
+        return jsonify({"connected": False, "qr_base64": None, "error": "Evolution n\u00e3o configurado. Preencha URL, API Key e Instance primeiro."})
+    try:
+        result = client.get_qr_code()
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"connected": False, "qr_base64": None, "error": str(exc)}), 500
 
 
 @app.post("/webhook/evolution")
