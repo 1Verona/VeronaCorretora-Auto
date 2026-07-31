@@ -793,7 +793,7 @@ if __name__ == "__main__":
     telegram_bot.flask_url = f"http://127.0.0.1:{port}"
     print(f" * Backend na porta {port}")
     flask_thread = threading.Thread(
-        target=lambda: app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False),
+        target=lambda: app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False),
         daemon=True,
     )
     flask_thread.start()
