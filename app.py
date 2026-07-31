@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from googleapiclient.errors import HttpError
 
 from agent_config import load_config as load_agent_cfg, save_config as save_agent_cfg, tools_catalog
@@ -45,6 +45,17 @@ BASE_DIR = Path(__file__).resolve().parent
 CREDENTIALS_PATH = DEFAULT_CREDENTIALS_PATH
 FLASK_PORT_FILE = BASE_DIR / ".flask_port"
 ENV_PATH = BASE_DIR / ".env"
+
+# Restaurar credentials.json a partir da env se não existir localmente (útil em ambientes como Easypanel)
+google_creds_env = os.environ.get("GOOGLE_CREDENTIALS")
+if google_creds_env and not CREDENTIALS_PATH.exists():
+    try:
+        import json
+        json_data = json.loads(google_creds_env)
+        CREDENTIALS_PATH.write_text(json.dumps(json_data, indent=2), encoding="utf-8")
+        print(" * credentials.json gerado a partir da variável de ambiente GOOGLE_CREDENTIALS")
+    except Exception as e:
+        print(f" * Erro ao decodificar GOOGLE_CREDENTIALS da env: {e}")
 
 
 def _read_env_file() -> dict[str, str]:
@@ -107,7 +118,11 @@ def find_free_port(start: int = 5050, max_attempts: int = 10) -> int:
 
 PROGRESS_RE = re.compile(r"\[(\d+)/(\d+)\]")
 
-app = Flask(__name__)
+app = Flask(
+    __name__,
+    static_folder=os.path.join(os.path.dirname(__file__), "frontend", "dist"),
+    static_url_path="/"
+)
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
 
@@ -760,6 +775,15 @@ def evolution_webhook(event=None):
     except Exception as exc:
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend(path):
+    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
+        return send_from_directory(app.static_folder, path)
+    else:
+        return send_from_directory(app.static_folder, "index.html")
 
 
 if __name__ == "__main__":

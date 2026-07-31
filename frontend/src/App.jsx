@@ -11,11 +11,14 @@ const STATUS_LABELS = {
 
 const TOKEN_KEY = 'verona_auth_token'
 
+const API_BASE = import.meta.env.VITE_API_URL || ''
+
 async function apiFetch(url, options = {}) {
   const token = localStorage.getItem(TOKEN_KEY) || ''
   const headers = { ...(options.headers || {}) }
   if (token) headers['Authorization'] = `Bearer ${token}`
-  const res = await fetch(url, { ...options, headers })
+  const fullUrl = url.startsWith('http') ? url : `${API_BASE}${url}`
+  const res = await fetch(fullUrl, { ...options, headers })
   if (res.status === 401) {
     localStorage.removeItem(TOKEN_KEY)
     window.location.reload()
@@ -34,7 +37,7 @@ function LoginScreen({ onLogin }) {
     setError('')
     setLoading(true)
     try {
-      const res = await fetch('/login', {
+      const res = await fetch(`${API_BASE}/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password }),
@@ -407,7 +410,7 @@ export default function App() {
   const toggleOutreach = async () => {
     const path = outreachConfig?.enabled ? '/outreach/stop' : '/outreach/start'
     try {
-      const res = await fetch(path, { method: 'POST' })
+      const res = await apiFetch(path, { method: 'POST' })
       const data = await res.json()
       if (data.config) setOutreachConfig(data.config)
       loadOutreachStatus()
@@ -424,7 +427,7 @@ export default function App() {
   const pauseConversation = async (phone, paused) => {
     const path = paused ? 'resume' : 'pause'
     try {
-      await fetch(`/outreach/conversations/${phone}/${path}`, { method: 'POST' })
+      await apiFetch(`/outreach/conversations/${phone}/${path}`, { method: 'POST' })
       loadOutreachStatus()
     } catch {}
   }
