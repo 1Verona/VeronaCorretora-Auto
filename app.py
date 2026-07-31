@@ -47,15 +47,18 @@ FLASK_PORT_FILE = BASE_DIR / ".flask_port"
 ENV_PATH = BASE_DIR / ".env"
 
 # Restaurar credentials.json a partir da env se não existir localmente (útil em ambientes como Easypanel)
+# Restaurar credentials.json a partir da env (útil em ambientes como Easypanel)
 google_creds_env = os.environ.get("GOOGLE_CREDENTIALS")
-if google_creds_env and not CREDENTIALS_PATH.exists():
+if google_creds_env:
     try:
         import json
         import base64
         
         # Tentar decodificar como base64 (evita problemas de aspas/caracteres especiais na env do Docker)
         try:
-            decoded_bytes = base64.b64decode(google_creds_env.strip(), validate=True)
+            # Remover quebras de linha e espaços comuns ao copiar e colar
+            clean_creds = "".join(google_creds_env.split())
+            decoded_bytes = base64.b64decode(clean_creds)
             decoded_str = decoded_bytes.decode("utf-8")
             json_data = json.loads(decoded_str)
         except Exception:
