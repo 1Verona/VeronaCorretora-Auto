@@ -51,7 +51,17 @@ google_creds_env = os.environ.get("GOOGLE_CREDENTIALS")
 if google_creds_env and not CREDENTIALS_PATH.exists():
     try:
         import json
-        json_data = json.loads(google_creds_env)
+        import base64
+        
+        # Tentar decodificar como base64 (evita problemas de aspas/caracteres especiais na env do Docker)
+        try:
+            decoded_bytes = base64.b64decode(google_creds_env.strip(), validate=True)
+            decoded_str = decoded_bytes.decode("utf-8")
+            json_data = json.loads(decoded_str)
+        except Exception:
+            # Caso não seja base64, tenta carregar o JSON direto
+            json_data = json.loads(google_creds_env)
+            
         CREDENTIALS_PATH.write_text(json.dumps(json_data, indent=2), encoding="utf-8")
         print(" * credentials.json gerado a partir da variável de ambiente GOOGLE_CREDENTIALS")
     except Exception as e:
