@@ -359,7 +359,7 @@ def build_config_from_request(form) -> ScraperConfig:
         output_sheet_name=(form.get("output_sheet_name") or cfg["output_sheet_name"]).strip() or cfg["output_sheet_name"],
         seccional=(form.get("seccional") or cfg["seccional"]).strip() or cfg["seccional"],
         limit=limit,
-        headless=False,
+        headless=True,
     )
 
 

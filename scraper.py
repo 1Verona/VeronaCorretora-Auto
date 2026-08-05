@@ -99,6 +99,10 @@ def build_sheets_service(credentials_path: Path):
 
 def normalize_spreadsheet_id(raw_value: str | None) -> str:
     spreadsheet_id = (raw_value or "").strip()
+    if "/d/" in spreadsheet_id:
+        parts = spreadsheet_id.split("/d/")
+        if len(parts) > 1:
+            spreadsheet_id = parts[1].split("/")[0].split("?")[0].split("#")[0]
     return spreadsheet_id or DEFAULT_SPREADSHEET_ID
 
 
@@ -322,10 +326,19 @@ async def setup_browser(
     ]
 
     if headless:
+        # Se pediu headless, tenta headed como fallback
         launch_profiles.append(
             {
                 "label": "Chromium headed fallback",
                 "kwargs": {"headless": False, "args": launch_args},
+            }
+        )
+    else:
+        # Se pediu headed, tenta headless como fallback (ex: servidor sem display)
+        launch_profiles.append(
+            {
+                "label": "Chromium headless fallback",
+                "kwargs": {"headless": True, "args": launch_args},
             }
         )
 
@@ -336,13 +349,13 @@ async def setup_browser(
         }
     )
 
-    if headless:
-        launch_profiles.append(
-            {
-                "label": "Google Chrome channel headed fallback",
-                "kwargs": {"headless": False, "channel": "chrome", "args": launch_args},
-            }
-        )
+    # Sempre adiciona fallback headless do Chrome como última tentativa
+    launch_profiles.append(
+        {
+            "label": "Chromium headless (último fallback)",
+            "kwargs": {"headless": True, "args": launch_args},
+        }
+    )
 
     browser = None
     launch_errors: list[str] = []
@@ -577,7 +590,7 @@ async def scrape_all_lawyers(
     results: list[dict[str, Any]] = []
 
     async with async_playwright() as playwright:
-        browser, context = await setup_browser(playwright, headless=False, log_callback=log_callback)
+        browser, context = await setup_browser(playwright, headless=headless, log_callback=log_callback)
         page = await context.new_page()
         await page.goto(OAB_URL, wait_until="networkidle", timeout=30000)
         await asyncio.sleep(1.0)
