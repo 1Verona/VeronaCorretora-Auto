@@ -11,3 +11,23 @@ node_modules/
 .env
 *.log
 
+
+# build / artefatos
+frontend/node_modules/
+frontend/dist/
+dist/
+StartDev.app/
+*.app/
+.pytest_cache/
+*.pyc
+# repositórios embutidos acidentalmente (eram gitlinks sem .gitmodules)
+neon/
+oab_scraper/
+# estado local
+data/
+*.db
+*.sqlite3
+conversations.json
+outreach_config.json
+.env.*
+!.env.example
