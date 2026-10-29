@@ -42,8 +42,10 @@ function LoginScreen({ onLogin }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password }),
       })
-      const data = await res.json()
-      if (data.ok && data.token) {
+      const data = await res.json().catch(() => ({}))
+      if (res.status === 429) {
+        setError(data.error || 'Muitas tentativas. Aguarde alguns minutos.')
+      } else if (data.ok && data.token) {
         localStorage.setItem(TOKEN_KEY, data.token)
         onLogin(data.token)
       } else {
@@ -1294,7 +1296,7 @@ export default function App() {
                         type="text"
                         value={evolutionConfig.evolution_webhook_token}
                         onChange={(e) => updateEvolutionField('evolution_webhook_token', e.target.value)}
-                        placeholder="token secreto (opcional)"
+                        placeholder="token secreto (obrigatório)"
                       />
                     </label>
                   </div>

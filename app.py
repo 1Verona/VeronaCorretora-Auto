@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import hmac as _hmac
 import os
 import re
 import socket
@@ -139,36 +137,53 @@ app = Flask(
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
 
-@app.after_request
-def add_cors(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    return response
-
-
 # ---------------------------------------------------------------------------
-# Auth
+# Segurança: CORS restrito, auth com token que expira, rate limit no /login
 # ---------------------------------------------------------------------------
 
-_ADMIN_USER = os.getenv("ADMIN_USER", "Admin").strip()
-_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
-_APP_SECRET = os.getenv("APP_SECRET", "verona-dev-secret").strip()
+from log_setup import get_logger
+from security import (
+    InsecureConfigError,
+    RateLimiter,
+    TokenService,
+    constant_eq,
+    cors_origins,
+    load_auth_settings,
+    mask_phone,
+)
+import storage
+
+log = get_logger("app")
+
+try:
+    _AUTH = load_auth_settings()
+except InsecureConfigError as _exc:
+    raise SystemExit(f"[SEGURANÇA] Recusando subir: {_exc}. Configure no .env (veja .env.example).")
+
+_ADMIN_USER = _AUTH["user"]
+_ADMIN_PASSWORD = _AUTH["password"]
+_tokens = TokenService(_AUTH["secret"], _AUTH["ttl"])
+_login_limiter = RateLimiter(
+    max_attempts=int(os.getenv("LOGIN_MAX_ATTEMPTS", "5")),
+    window=int(os.getenv("LOGIN_WINDOW_SECONDS", "300")),
+)
 
 _AUTH_SKIP_PREFIXES = ("/webhook/",)
-_AUTH_SKIP_EXACT = {"/login"}
+_AUTH_SKIP_EXACT = {"/login", "/health"}
 
 
-def _make_token(user: str, pw: str) -> str:
-    msg = f"{user}:{pw}".encode()
-    return _hmac.new(_APP_SECRET.encode(), msg, hashlib.sha256).hexdigest()
-
-
-def _verify_token(token: str) -> bool:
-    if not _ADMIN_PASSWORD:
-        return True  # sem senha configurada = acesso livre (dev local)
-    expected = _make_token(_ADMIN_USER, _ADMIN_PASSWORD)
-    return _hmac.compare_digest(token, expected)
+@app.after_request
+def add_cors(response):
+    origin = (request.headers.get("Origin") or "").rstrip("/")
+    allowed = cors_origins()
+    if origin and origin in allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    return response
 
 
 @app.before_request
@@ -178,26 +193,31 @@ def check_auth():
     path = request.path
     if path in _AUTH_SKIP_EXACT or any(path.startswith(p) for p in _AUTH_SKIP_PREFIXES):
         return None
-    if not _ADMIN_PASSWORD:
-        return None  # auth desativada localmente
+    # arquivos estáticos / rotas do SPA não têm dados; toda a API exige token
+    if request.endpoint in ("serve_frontend", "static"):
+        return None
     auth = request.headers.get("Authorization", "")
-    token = ""
-    if auth.lower().startswith("bearer "):
-        token = auth.split(" ", 1)[1].strip()
-    if not token or not _verify_token(token):
+    token = auth.split(" ", 1)[1].strip() if auth.lower().startswith("bearer ") else ""
+    if not token or not _tokens.verify(token):
         return jsonify({"error": "Não autorizado", "auth_required": True}), 401
     return None
 
 
 @app.post("/login")
 def login():
-    payload = request.get_json(silent=True) or {}
-    user = (payload.get("username") or "").strip()
-    pw = (payload.get("password") or "").strip()
-    if not _ADMIN_PASSWORD:
-        return jsonify({"ok": True, "token": "no-auth"})
-    if user == _ADMIN_USER and pw == _ADMIN_PASSWORD:
-        return jsonify({"ok": True, "token": _make_token(user, pw)})
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
+    if not _login_limiter.hit(ip):
+        log.warning("login bloqueado por rate limit", extra={"ctx": {"ip": ip}})
+        return jsonify({"ok": False, "error": "Muitas tentativas. Aguarde alguns minutos."}), 429
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        payload = {}
+    user = str(payload.get("username") or "").strip()
+    pw = str(payload.get("password") or "").strip()
+    if constant_eq(user, _ADMIN_USER) and constant_eq(pw, _ADMIN_PASSWORD):
+        _login_limiter.reset(ip)
+        return jsonify({"ok": True, "token": _tokens.issue(user), "expires_in": _tokens.ttl})
+    log.info("login inválido", extra={"ctx": {"ip": ip}})
     return jsonify({"ok": False, "error": "Usuário ou senha incorretos"}), 401
 
 
@@ -288,7 +308,7 @@ class JobManager:
             return stop_event.is_set()
 
         try:
-            summary = run_scrape(config, log_callback=logger, stop_check=stop_check)
+            summary = run_scrape(config, log_callback=logger, stop_check=stop_check, alert_callback=_notify_broker)
             with self._lock:
                 if not self._current_job or self._current_job.get("job_id") != job_id:
                     return
@@ -303,6 +323,7 @@ class JobManager:
                 self._stop_events.pop(job_id, None)
         except Exception as exc:
             logger(f"Falha no job: {exc}")
+            _notify_broker(f"⚠️ Raspagem OAB falhou: {str(exc)[:300]}")
             logger(traceback.format_exc())
             with self._lock:
                 failed_job = self._current_job if self._current_job and self._current_job.get("job_id") == job_id else None
@@ -552,13 +573,15 @@ def leadgen_run_now():
 def healthcheck():
     state = job_manager.get_state()
     active = state.get("job")
-    return jsonify(
-        {
-            "ok": True,
-            "credentials_present": CREDENTIALS_PATH.exists(),
-            "job_running": bool(active and active.get("status") == "running"),
-        }
-    )
+    db_ok = storage.ping()
+    body = {
+        "ok": db_ok,
+        "db": db_ok,
+        "credentials_present": CREDENTIALS_PATH.exists(),
+        "job_running": bool(active and active.get("status") == "running"),
+        "outreach_thread_alive": bool(outreach_worker._thread and outreach_worker._thread.is_alive()),
+    }
+    return jsonify(body), (200 if db_ok else 503)
 
 
 @app.get("/outreach/config")
@@ -700,7 +723,7 @@ def evolution_get_config():
         "evolution_api_key_set": bool(api_key),
         "evolution_api_key_masked": masked_key,
         "evolution_instance": env.get("EVOLUTION_INSTANCE", ""),
-        "evolution_webhook_token": env.get("EVOLUTION_WEBHOOK_TOKEN", ""),
+        "evolution_webhook_token": ("***" if env.get("EVOLUTION_WEBHOOK_TOKEN") else ""),
         "configured": client.configured,
     })
 
@@ -724,7 +747,7 @@ def evolution_set_config():
             updates["EVOLUTION_API_KEY"] = key
     if "evolution_instance" in payload:
         updates["EVOLUTION_INSTANCE"] = str(payload["evolution_instance"]).strip()
-    if "evolution_webhook_token" in payload:
+    if "evolution_webhook_token" in payload and str(payload["evolution_webhook_token"]).strip() not in ("", "***"):
         updates["EVOLUTION_WEBHOOK_TOKEN"] = str(payload["evolution_webhook_token"]).strip()
 
     if not updates:
@@ -763,31 +786,49 @@ def evolution_qr():
 @app.post("/webhook/evolution/<event>")
 def evolution_webhook(event=None):
     expected_token = os.getenv("EVOLUTION_WEBHOOK_TOKEN", "").strip()
-    if expected_token:
-        auth = request.headers.get("Authorization", "")
-        token_query = request.args.get("token", "")
-        provided = ""
-        if auth.lower().startswith("bearer "):
-            provided = auth.split(" ", 1)[1].strip()
-        elif token_query:
-            provided = token_query.strip()
-        if provided != expected_token:
-            return jsonify({"error": "unauthorized"}), 401
+    if not expected_token:
+        log.error("webhook recusado: EVOLUTION_WEBHOOK_TOKEN não configurado")
+        return jsonify({"error": "webhook desabilitado: configure EVOLUTION_WEBHOOK_TOKEN"}), 503
+    auth = request.headers.get("Authorization", "")
+    provided = ""
+    if auth.lower().startswith("bearer "):
+        provided = auth.split(" ", 1)[1].strip()
+    else:
+        provided = (request.headers.get("X-Webhook-Token") or request.args.get("token") or "").strip()
+    if not constant_eq(provided, expected_token):
+        log.warning("webhook com token inválido", extra={"ctx": {"ip": request.remote_addr}})
+        return jsonify({"error": "unauthorized"}), 401
 
-    payload = request.get_json(silent=True) or {}
-    import json as _json
-    print(f"[WEBHOOK DEBUG] event={event}")
-    print(f"[WEBHOOK DEBUG] payload keys: {list(payload.keys())}")
-    print(f"[WEBHOOK DEBUG] payload (truncated): {_json.dumps(payload, ensure_ascii=False)[:1000]}")
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"ok": True, "result": {"ignored": True, "reason": "payload inválido"}})
     try:
         from conversation_engine import handle_inbound_payload
 
         result = handle_inbound_payload(payload, notify_broker=_notify_broker)
-        print(f"[WEBHOOK DEBUG] result: {result}")
+        # Nunca logar texto da mensagem nem telefone completo (LGPD)
+        log.info("webhook processado", extra={"ctx": {"event": event, "action": (result or {}).get("action") or (result or {}).get("reason")}})
         return jsonify({"ok": True, "result": result})
-    except Exception as exc:
-        traceback.print_exc()
-        return jsonify({"ok": False, "error": str(exc)}), 500
+    except Exception:
+        log.exception("falha ao processar webhook", extra={"ctx": {"event": event}})
+        return jsonify({"ok": False, "error": "erro interno"}), 500
+
+
+@app.get("/blocklist")
+def blocklist_list():
+    return jsonify({"blocked": [{**b, "phone": mask_phone(b["phone"])} for b in storage.list_blocked()]})
+
+
+@app.post("/blocklist")
+def blocklist_add():
+    from evolution_client import normalize_phone
+
+    payload = request.get_json(silent=True) or {}
+    phone = normalize_phone(str(payload.get("phone", "")))
+    if not phone:
+        return jsonify({"error": "telefone inválido"}), 400
+    storage.block(phone, str(payload.get("reason") or "manual"))
+    return jsonify({"ok": True})
 
 
 @app.route("/", defaults={"path": ""})
@@ -801,7 +842,7 @@ def serve_frontend(path):
 
 if __name__ == "__main__":
     cleanup_cache()
-    port = find_free_port(5050)
+    port = find_free_port(int(os.getenv("PORT", "5050")))
     FLASK_PORT_FILE.write_text(str(port))
     telegram_bot.flask_url = f"http://127.0.0.1:{port}"
     print(f" * Backend na porta {port}")
