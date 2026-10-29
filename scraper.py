@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import random
 import re
 import time
@@ -113,7 +114,7 @@ def inspect_spreadsheet(credentials_path: Path, spreadsheet_id: str) -> dict[str
     spreadsheet = service.spreadsheets().get(
         spreadsheetId=spreadsheet_id,
         fields="properties.title,sheets.properties.title,sheets.properties.gridProperties",
-    ).execute()
+    ).execute(num_retries=4)
 
     sheets = []
     for sheet in spreadsheet.get("sheets", []):
@@ -208,7 +209,7 @@ def get_white_leads(
             "sheets.data.rowData.values.formattedValue,"
             "sheets.data.rowData.values.userEnteredFormat.backgroundColor"
         ),
-    ).execute()
+    ).execute(num_retries=4)
 
     sheets_by_title: dict[str, dict[str, Any]] = {}
     for sheet in spreadsheet.get("sheets", []):
@@ -268,7 +269,7 @@ def count_leads_per_sheet(service, spreadsheet_id: str, output_sheet_name: str =
             "sheets.data.rowData.values.formattedValue,"
             "sheets.data.rowData.values.userEnteredFormat.backgroundColor"
         ),
-    ).execute()
+    ).execute(num_retries=4)
 
     header_keywords = {"nome", "name", "advogado"}
     counts: dict[str, int] = {}
@@ -306,6 +307,15 @@ def preview_white_leads(config: ScraperConfig) -> dict[str, Any]:
         "total_white_rows": len(leads),
         "sample": leads[:10],
     }
+
+
+OAB_TIMEOUT_MS = int(os.getenv("OAB_TIMEOUT_MS", "30000"))
+OAB_OPEN_RETRIES = int(os.getenv("OAB_OPEN_RETRIES", "3"))
+OAB_MAX_CONSECUTIVE_FAILURES = int(os.getenv("OAB_MAX_CONSECUTIVE_FAILURES", "5"))
+
+
+class OABUnavailableError(RuntimeError):
+    pass
 
 
 async def setup_browser(
@@ -586,16 +596,30 @@ async def scrape_all_lawyers(
     max_delay: float,
     log_callback: Callable[[str], None] | None = None,
     stop_check: Callable[[], bool] | None = None,
+    alert_callback: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
 
     async with async_playwright() as playwright:
         browser, context = await setup_browser(playwright, headless=headless, log_callback=log_callback)
         page = await context.new_page()
-        await page.goto(OAB_URL, wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(1.0)
+        last_exc: Exception | None = None
+        for attempt in range(1, OAB_OPEN_RETRIES + 1):
+            try:
+                await page.goto(OAB_URL, wait_until="networkidle", timeout=OAB_TIMEOUT_MS)
+                await asyncio.sleep(1.0)
+                await warmup_captcha(page, seccional, log_callback)
+                last_exc = None
+                break
+            except Exception as exc:  # timeout, site fora do ar, layout mudou
+                last_exc = exc
+                log(log_callback, f"Site da OAB não abriu (tentativa {attempt}/{OAB_OPEN_RETRIES}): {str(exc)[:150]}")
+                await asyncio.sleep(min(60, 5 * 2 ** attempt))
+        if last_exc is not None:
+            await browser.close()
+            raise OABUnavailableError(f"site da OAB indisponível após {OAB_OPEN_RETRIES} tentativas: {str(last_exc)[:200]}")
 
-        await warmup_captcha(page, seccional, log_callback)
+        consecutive_failures = 0
 
         for index, lead in enumerate(leads, start=1):
             if stop_check and stop_check():
@@ -615,6 +639,20 @@ async def scrape_all_lawyers(
             merged = {**lead, **result}
             results.append(merged)
 
+            erro_r = str(result.get("erro") or "")
+            if not result.get("encontrado") and erro_r not in ("nenhum_resultado", ""):
+                consecutive_failures += 1
+            else:
+                consecutive_failures = 0
+            if consecutive_failures >= OAB_MAX_CONSECUTIVE_FAILURES:
+                log(log_callback, f"Abortando: {consecutive_failures} falhas seguidas no site da OAB (possível bloqueio ou mudança no site)")
+                if alert_callback:
+                    alert_callback(
+                        f"⚠️ Raspagem OAB interrompida: {consecutive_failures} falhas seguidas. "
+                        f"Último erro: {erro_r[:150]}. Resultados parciais ({len(results)}) foram salvos."
+                    )
+                break
+
             tel = result.get("telefone_oab", "") or "—"
             oab = result.get("oab_num", "") or "—"
             erro = result.get("erro", "")
@@ -629,7 +667,7 @@ async def scrape_all_lawyers(
 
 
 def ensure_output_sheet(service, spreadsheet_id: str, output_sheet_name: str) -> None:
-    metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute(num_retries=4)
     existing = [sheet["properties"]["title"] for sheet in metadata.get("sheets", [])]
     if output_sheet_name in existing:
         return
@@ -637,7 +675,7 @@ def ensure_output_sheet(service, spreadsheet_id: str, output_sheet_name: str) ->
     service.spreadsheets().batchUpdate(
         spreadsheetId=spreadsheet_id,
         body={"requests": [{"addSheet": {"properties": {"title": output_sheet_name}}}]},
-    ).execute()
+    ).execute(num_retries=4)
 
 
 def write_results(
@@ -675,14 +713,14 @@ def write_results(
         spreadsheetId=spreadsheet_id,
         range=clear_range,
         body={},
-    ).execute()
+    ).execute(num_retries=4)
 
     service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
         range=f"{output_sheet_name}!A1",
         valueInputOption="RAW",
         body={"values": rows},
-    ).execute()
+    ).execute(num_retries=4)
 
 
 def save_json_backup(results: list[dict[str, Any]], output_path: Path | None = None) -> Path:
@@ -708,6 +746,7 @@ def run_scrape(
     *,
     log_callback: Callable[[str], None] | None = None,
     stop_check: Callable[[], bool] | None = None,
+    alert_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     removed = cleanup_cache()
     if removed:
@@ -753,6 +792,7 @@ def run_scrape(
             max_delay=config.max_delay,
             log_callback=log_callback,
             stop_check=stop_check,
+            alert_callback=alert_callback,
         )
     )
 

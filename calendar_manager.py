@@ -85,7 +85,7 @@ class CalendarManager:
             body=body,
             sendUpdates="all",
             conferenceDataVersion=1,
-        ).execute()
+        ).execute(num_retries=4)
         return event
 
     def list_upcoming(self, max_results: int = 10) -> list[dict[str, Any]]:
@@ -96,5 +96,5 @@ class CalendarManager:
             maxResults=max_results,
             singleEvents=True,
             orderBy="startTime",
-        ).execute()
+        ).execute(num_retries=4)
         return result.get("items", [])

@@ -13,6 +13,24 @@ from googleapiclient.errors import HttpError
 from evolution_client import normalize_phone, phone_variants
 from scraper import DEFAULT_CREDENTIALS_PATH, DEFAULT_SPREADSHEET_ID, SCOPES
 
+import functools
+import os
+import threading
+
+# Escritas na planilha: serializadas por lock (evita corrida entre disparo,
+# webhook e bot) e com retry exponencial nativo do googleapiclient (429/5xx).
+SHEETS_RETRIES = int(os.getenv("SHEETS_RETRIES", "4"))
+_write_lock = threading.RLock()
+
+
+def _serialized(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _write_lock:
+            return fn(*args, **kwargs)
+    return wrapper
+
+
 OUTREACH_COLUMNS = ["Primeiro_contato_em", "Estagio_conversa", "Evolution_jid", "Reuniao_em", "Reuniao_link"]
 
 STATUS_KEYWORDS = {
@@ -42,14 +60,14 @@ class SheetManager:
         metadata = self.service.spreadsheets().get(
             spreadsheetId=self.spreadsheet_id,
             fields="sheets.properties.title",
-        ).execute()
+        ).execute(num_retries=SHEETS_RETRIES)
         return [s["properties"]["title"] for s in metadata.get("sheets", [])]
 
     def get_all_rows_from_sheet(self, sheet_name: str) -> list[dict[str, Any]]:
         result = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
             range=sheet_name,
-        ).execute()
+        ).execute(num_retries=SHEETS_RETRIES)
         values = result.get("values", [])
         if not values:
             return []
@@ -99,11 +117,12 @@ class SheetManager:
         results.sort(key=lambda x: x["score"], reverse=True)
         return results[:max_results]
 
+    @_serialized
     def ensure_columns(self, sheet_name: str, required: list[str]) -> None:
         result = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
             range=f"{sheet_name}!A1:ZZ1",
-        ).execute()
+        ).execute(num_retries=SHEETS_RETRIES)
         values = result.get("values", [])
         existing = [h.lower().strip() for h in (values[0] if values else [])]
 
@@ -122,15 +141,16 @@ class SheetManager:
             range=update_range,
             valueInputOption="RAW",
             body={"values": [to_add]},
-        ).execute()
+        ).execute(num_retries=SHEETS_RETRIES)
 
+    @_serialized
     def update_client_status(self, sheet_name: str, row: int, status: str, notes: str = "", follow_up_date: str = "") -> dict[str, Any]:
         self.ensure_columns(sheet_name, ["Status", "Notas", "Follow-up"])
 
         result = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
             range=f"{sheet_name}!A1:ZZ1",
-        ).execute()
+        ).execute(num_retries=SHEETS_RETRIES)
         headers = [h.lower().strip() for h in (result.get("values", [[]])[0])]
 
         status_col = headers.index("status") + 1 if "status" in headers else None
@@ -152,7 +172,7 @@ class SheetManager:
             result = self.service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
                 range=f"{sheet_name}!{col_letter}{row}",
-            ).execute()
+            ).execute(num_retries=SHEETS_RETRIES)
             current_notes = (result.get("values", [[]])[0][0] if result.get("values") else "")
             new_note = f"[{now}] {notes}" if notes else ""
             combined = f"{current_notes}\n{new_note}".strip() if current_notes else new_note
@@ -172,7 +192,7 @@ class SheetManager:
             self.service.spreadsheets().values().batchUpdate(
                 spreadsheetId=self.spreadsheet_id,
                 body={"valueInputOption": "RAW", "data": updates},
-            ).execute()
+            ).execute(num_retries=SHEETS_RETRIES)
 
         return {"updated": True, "sheet": sheet_name, "row": row, "status": status}
 
@@ -304,9 +324,10 @@ class SheetManager:
         result = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
             range=f"{sheet_name}!A1:ZZ1",
-        ).execute()
+        ).execute(num_retries=SHEETS_RETRIES)
         return [h.lower().strip() for h in (result.get("values", [[]])[0])]
 
+    @_serialized
     def _batch_update_row(self, sheet_name: str, row: int, fields: dict[str, str]) -> None:
         headers = self._read_headers(sheet_name)
         updates = []
@@ -324,7 +345,7 @@ class SheetManager:
             self.service.spreadsheets().values().batchUpdate(
                 spreadsheetId=self.spreadsheet_id,
                 body={"valueInputOption": "RAW", "data": updates},
-            ).execute()
+            ).execute(num_retries=SHEETS_RETRIES)
 
     def get_leads_pending_first_contact(
         self,
@@ -360,6 +381,7 @@ class SheetManager:
                     return pending
         return pending
 
+    @_serialized
     def mark_first_contact(self, sheet_name: str, row: int, when: datetime, template_used: str = "", jid: str = "") -> None:
         self.ensure_columns(sheet_name, OUTREACH_COLUMNS)
         timestamp = when.strftime("%d/%m/%Y %H:%M")
@@ -378,10 +400,12 @@ class SheetManager:
                 notes=f"Template usado: {template_used[:80]}",
             )
 
+    @_serialized
     def update_stage(self, sheet_name: str, row: int, stage: str) -> None:
         self.ensure_columns(sheet_name, OUTREACH_COLUMNS)
         self._batch_update_row(sheet_name, row, {"Estagio_conversa": stage})
 
+    @_serialized
     def mark_meeting_scheduled(
         self,
         sheet_name: str,
@@ -410,6 +434,7 @@ class SheetManager:
             follow_up_date=when.strftime("%d/%m/%Y"),
         )
 
+    @_serialized
     def mark_not_interested(self, sheet_name: str, row: int, reason: str = "") -> None:
         self.ensure_columns(sheet_name, OUTREACH_COLUMNS)
         self._batch_update_row(sheet_name, row, {"Estagio_conversa": "NOT_INTERESTED"})
@@ -438,6 +463,7 @@ class SheetManager:
                     }
         return None
 
+    @_serialized
     def add_client(
         self,
         sheet_name: str,
@@ -454,7 +480,7 @@ class SheetManager:
         result = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
             range=f"{sheet_name}!A1:ZZ1",
-        ).execute()
+        ).execute(num_retries=SHEETS_RETRIES)
         headers = [h.lower().strip() for h in (result.get("values", [[]])[0])]
         if not headers:
             return {"added": False, "error": f"Aba '{sheet_name}' sem cabeçalho."}
@@ -463,7 +489,7 @@ class SheetManager:
         result = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
             range=f"{sheet_name}!A1:ZZ1",
-        ).execute()
+        ).execute(num_retries=SHEETS_RETRIES)
         headers = [h.lower().strip() for h in (result.get("values", [[]])[0])]
 
         now = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -488,6 +514,6 @@ class SheetManager:
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": [row_values]},
-        ).execute()
+        ).execute(num_retries=SHEETS_RETRIES)
 
         return {"added": True, "sheet": sheet_name, "nome": nome}
