@@ -15,6 +15,12 @@ from dotenv import load_dotenv
 from agent_config import active_tools, load_config as load_agent_config
 from evolution_client import EvolutionClient, EvolutionError, jid_to_phone, normalize_phone, phone_variants
 from sheet_manager import SheetManager
+import optout
+import storage
+from log_setup import get_logger
+from security import mask_phone
+
+log = get_logger("conversation")
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -34,7 +40,7 @@ STAGES = {
     "HUMAN_TAKEOVER",
 }
 
-_lock = threading.Lock()
+_lock = threading.RLock()  # reentrante: _upsert é chamado dentro de blocos que já seguram o lock
 _evolution = EvolutionClient()
 _sheets = SheetManager()
 _openai_client = None
@@ -50,28 +56,16 @@ def _client():
 
 
 def _load_all() -> dict[str, Any]:
-    if not CONVERSATIONS_PATH.exists():
-        return {}
-    try:
-        return json.loads(CONVERSATIONS_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _save_all(data: dict[str, Any]) -> None:
-    CONVERSATIONS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return storage.all_conversations()
 
 
 def _get(phone: str) -> dict[str, Any] | None:
-    data = _load_all()
-    return data.get(phone)
+    return storage.get_conversation(phone)
 
 
 def _upsert(phone: str, conv: dict[str, Any]) -> None:
     with _lock:
-        data = _load_all()
-        data[phone] = conv
-        _save_all(data)
+        storage.save_conversation(phone, conv)
 
 
 def _history_limit() -> int:
@@ -137,13 +131,13 @@ def list_conversations() -> list[dict[str, Any]]:
 def set_paused(phone: str, paused: bool) -> bool:
     normalized = normalize_phone(phone)
     with _lock:
-        data = _load_all()
-        if normalized not in data:
+        conv = storage.get_conversation(normalized)
+        if conv is None:
             return False
-        data[normalized]["paused_by_broker"] = paused
+        conv["paused_by_broker"] = paused
         if paused:
-            data[normalized]["stage"] = "HUMAN_TAKEOVER"
-        _save_all(data)
+            conv["stage"] = "HUMAN_TAKEOVER"
+        storage.save_conversation(normalized, conv)
     return True
 
 
@@ -189,6 +183,13 @@ def handle_inbound_payload(
         if not test_phone or not (phone_variants(phone) & phone_variants(test_phone)):
             return {"ignored": True, "reason": "test_mode", "test_phone": test_phone}
 
+    if optout.is_opt_out(text):
+        return _handle_opt_out(phone, text, notify_broker)
+
+    if storage.is_blocked(phone):
+        # já pediu para sair: não responder nunca mais
+        return {"ignored": True, "reason": "blocked"}
+
     # Fix #4: toda a leitura + escrita da conversa dentro do lock para evitar race condition
     with _lock:
         conv = _get(phone)
@@ -229,6 +230,33 @@ def handle_inbound_payload(
     with _lock:
         _upsert(phone, conv)
     return result
+
+
+OPT_OUT_CONFIRMATION = os.getenv(
+    "OPT_OUT_CONFIRMATION",
+    "Tudo bem, você não receberá mais mensagens nossas. Desculpe o incômodo!",
+)
+
+
+def _handle_opt_out(phone: str, text: str, notify_broker: Callable[[str], None]) -> dict[str, Any]:
+    already = storage.is_blocked(phone)
+    storage.block(phone, "opt-out pelo lead")
+    with _lock:
+        conv = _get(phone) or {"phone": phone, "nome": "", "history": [], "collected": {}}
+        conv["stage"] = "NOT_INTERESTED"
+        conv["opted_out"] = True
+        conv["paused_by_broker"] = True
+        _append_history(conv, "user", text)
+        storage.save_conversation(phone, conv)
+    if not already:
+        try:
+            _evolution.send_text(phone, OPT_OUT_CONFIRMATION)
+        except Exception:
+            pass
+        _close_not_interested(conv, "opt-out: pediu para não ser contatado")
+        notify_broker(f"🚫 Lead {conv.get('nome') or mask_phone(phone)} pediu para sair. Bloqueado para sempre.")
+    log.info("opt-out registrado", extra={"ctx": {"phone": mask_phone(phone)}})
+    return {"action": "opt_out", "already_blocked": already}
 
 
 def _llm_decide(conv: dict[str, Any], inbound_text: str) -> dict[str, Any]:
@@ -320,6 +348,7 @@ def _apply_decision(
         if despedida:
             _send_outbound(conv, despedida)
         conv["stage"] = "NOT_INTERESTED"
+        storage.block(conv["phone"], f"sem interesse: {motivo}"[:200])
         _close_not_interested(conv, motivo)
         notify_broker(f"❌ Lead {conv.get('nome') or conv['phone']} sem interesse.\nMotivo: {motivo}")
         return {"action": "sem_interesse", "motivo": motivo}
