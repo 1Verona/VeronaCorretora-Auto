@@ -112,9 +112,27 @@ def render_template(template: str, nome: str) -> str:
     Usa replace() em vez de format() para não quebrar com placeholders inesperados.
     Garante que nome vazio não gere vírgula solta (ex: 'Olá , tudo bem?').
     """
-    first_name = (nome or "").strip().split()[0] if (nome or "").strip() else ""
+    raw = (nome or "").strip()
+    first_name = raw.split()[0] if raw else ""
+    # Leads do OSM/CNPJ costumam ser nome de escritório ("Advocacia X", "SOCIEDADE
+    # DE ADVOGADOS ... LTDA"): "Olá Advocacia!" / "Olá SOCIEDADE!" soava robótico.
+    if _looks_like_company(raw):
+        first_name = ""
+    elif first_name.isupper() and len(first_name) > 2:
+        first_name = first_name.capitalize()
     display_name = first_name if first_name else "Prezado(a)"
     return template.replace("{nome}", display_name)
+
+
+_COMPANY_WORDS = {
+    "advocacia", "advogados", "advogadas", "sociedade", "escritorio", "escritório", "ltda", "eireli",
+    "associados", "associadas", "consultoria", "assessoria", "juridica", "jurídica", "s/s", "ss", "me", "epp",
+}
+
+
+def _looks_like_company(name: str) -> bool:
+    words = {w.strip(".,()&-").lower() for w in (name or "").split()}
+    return bool(words & _COMPANY_WORDS) or "&" in (name or "")
 
 
 class OutreachWorker:
@@ -275,6 +293,12 @@ class OutreachWorker:
         if not self.evolution.configured:
             self._paused_reason = "Evolution não configurado"
             return {"sent": False, "error": "evolution_not_configured"}
+
+        # Revalida o limite já com o lock: o laço e o "disparar agora" checavam
+        # antes de pegar o lead e, juntos, podiam passar do limite em 1+ envios.
+        today = datetime.now(TZ).date()
+        if storage.get_sent(today.isoformat()) >= effective_daily_limit(config, today):
+            return {"sent": False, "error": "limite diário atingido", "limit_reached": True}
 
         source = (load_sheets_config().get("source_sheet") or "").strip() or None
         agent_cfg = load_agent_config()
