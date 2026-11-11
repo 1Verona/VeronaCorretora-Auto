@@ -149,13 +149,10 @@ class _Values:
 
 class FakeCalendarService:
     def __init__(self):
-        self.events: list[dict[str, Any]] = []
+        self.created: list[dict[str, Any]] = []
         self.calls: Counter = Counter()
 
-    def events_(self):
-        return self
-
-    def events(self):  # noqa: D401 - API compatível
+    def events(self):
         return _Events(self)
 
 
@@ -165,10 +162,10 @@ class _Events:
 
     def insert(self, calendarId: str, body: dict, sendUpdates: str = "", conferenceDataVersion: int = 0):
         def run():
-            ev = {**body, "id": uuid.uuid4().hex[:10], "hangoutLink": f"https://meet.google.com/fic-ticio-{len(self.c.events)+1:03d}", "htmlLink": "https://calendar.google.com/FICTICIO"}
-            self.c.events.append(ev)
+            ev = {**body, "id": uuid.uuid4().hex[:10], "hangoutLink": f"https://meet.google.com/fic-ticio-{len(self.c.created)+1:03d}", "htmlLink": "https://calendar.google.com/FICTICIO"}
+            self.c.created.append(ev)
             return ev
         return _Req(run, self.c.calls, "events.insert")
 
     def list(self, calendarId: str, **kw):
-        return _Req(lambda: {"items": list(self.c.events)}, self.c.calls, "events.list")
+        return _Req(lambda: {"items": list(self.c.created)}, self.c.calls, "events.list")

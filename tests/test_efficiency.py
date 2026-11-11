@@ -316,3 +316,24 @@ def test_mesmo_telefone_em_duas_abas_recebe_uma_vez(ow):
         w._send_one({**ow.DEFAULT_CONFIG})
     assert ev.sent == ["(48) 90000-0009"]
     assert svc.rows_as_dicts("Leads_CNPJ_SC")[0]["estagio_conversa"] == "DUPLICADO"
+
+
+def test_limite_revalidado_dentro_do_lock(ow, monkeypatch):
+    from test_outreach import FakeSheets, FakeEvolution
+    cfg = {**ow.DEFAULT_CONFIG, "warmup_enabled": False, "daily_limit": 3}
+    w = ow.OutreachWorker(sheet_manager=FakeSheets(), evolution=FakeEvolution())
+    ts = [threading.Thread(target=w._send_one, args=(cfg,)) for _ in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(w.evolution.sent) == 3
+
+
+@pytest.mark.parametrize("nome,esperado", [
+    ("Advocacia FICTÍCIA 01", "Olá Prezado(a),"),
+    ("SOCIEDADE DE ADVOGADOS FICTÍCIA LTDA", "Olá Prezado(a),"),
+    ("MARIA FICTÍCIA SOUZA", "Olá Maria,"),
+    ("Carlos Fictício", "Olá Carlos,"),
+    ("", "Olá Prezado(a),"),
+])
+def test_saudacao_nao_usa_nome_de_empresa(ow, nome, esperado):
+    assert ow.render_template("Olá {nome}, tudo bem?", nome).startswith(esperado)
