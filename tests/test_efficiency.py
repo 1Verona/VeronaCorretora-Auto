@@ -285,3 +285,34 @@ def test_reset_de_erros_pelo_painel(client, app_module):
     assert client.post("/outreach/reset-errors", headers=h).status_code == 200
     assert app_module.outreach_worker._consecutive_errors == 0
     assert storage.kv_get("consecutive_errors") == 0
+
+
+def test_bloqueado_sai_da_fila_e_nao_e_remarcado(ow):
+    import sheet_manager as sm
+    hdr = ["Status", "Nome", "Telefone", "Notas"]
+    svc = FakeSheetsService({"L": [hdr, ["", "Dr FICTÍCIO A", "(48) 90000-0001", ""], ["", "Dr FICTÍCIO B", "(48) 90000-0002", ""]]})
+    m = sm.SheetManager(); m._service = svc
+    storage.block("5548900000001", "teste")
+    ev = _Ev()
+    w = ow.OutreachWorker(sheet_manager=m, evolution=ev)
+    w._send_one({**ow.DEFAULT_CONFIG})
+    w._send_one({**ow.DEFAULT_CONFIG})
+    rows = svc.rows_as_dicts("L")
+    assert rows[0]["estagio_conversa"] == "NOT_INTERESTED" and rows[0]["notas"].count("opt-out") == 1
+    assert ev.sent == ["(48) 90000-0002"]
+
+
+def test_mesmo_telefone_em_duas_abas_recebe_uma_vez(ow):
+    import sheet_manager as sm
+    hdr = ["Status", "Nome", "Telefone", "Notas"]
+    svc = FakeSheetsService({
+        "Leads_OSM_SC": [hdr, ["", "Escritório FICTÍCIO", "(48) 90000-0009", ""]],
+        "Leads_CNPJ_SC": [hdr, ["", "ESCRITORIO FICTICIO LTDA", "48900000009", ""]],
+    })
+    m = sm.SheetManager(); m._service = svc
+    ev = _Ev()
+    w = ow.OutreachWorker(sheet_manager=m, evolution=ev)
+    for _ in range(3):
+        w._send_one({**ow.DEFAULT_CONFIG})
+    assert ev.sent == ["(48) 90000-0009"]
+    assert svc.rows_as_dicts("Leads_CNPJ_SC")[0]["estagio_conversa"] == "DUPLICADO"

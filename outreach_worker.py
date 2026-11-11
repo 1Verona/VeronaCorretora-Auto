@@ -361,15 +361,23 @@ class OutreachWorker:
         return {"sent": True, "lead": lead, "template": template}
 
     def _repair_sheet_mark(self, cand: dict[str, Any], phone_norm: str) -> None:
+        """Lead pendente na planilha cujo telefone já recebeu a 1ª mensagem.
+        Mesma linha (planilha falhou na hora): marca o contato. Outra linha/aba
+        (mesmo advogado no OSM e no CNPJ): marca como duplicado. Nunca reenvia."""
         info = storage.sent_get(phone_norm) or {}
-        if info.get("sheet_marked"):
-            return
+        same_row = info.get("sheet") == cand.get("sheet") and int(info.get("row") or 0) == int(cand.get("row") or 0)
         try:
-            when = datetime.fromtimestamp(float(info.get("sent_at") or time.time()), TZ)
-            self.sheet_manager.mark_first_contact(
-                sheet_name=cand["sheet"], row=cand["row"], when=when, template_used="", jid=to_jid(cand["telefone"]),
-            )
-            storage.set_sheet_marked(phone_norm)
+            if same_row or not info:
+                when = datetime.fromtimestamp(float(info.get("sent_at") or time.time()), TZ)
+                self.sheet_manager.mark_first_contact(
+                    sheet_name=cand["sheet"], row=cand["row"], when=when, template_used="", jid=to_jid(cand["telefone"]),
+                )
+                if info:
+                    storage.set_sheet_marked(info["phone"])
+            else:
+                mark_dup = getattr(self.sheet_manager, "mark_duplicate_contact", None)
+                if mark_dup:
+                    mark_dup(cand["sheet"], cand["row"], f"Telefone já contatado via {info.get('sheet')} linha {info.get('row')} — não reenviado")
         except Exception as exc:
             log.warning("planilha ainda sem marcar lead já contatado", extra={"ctx": {"error": str(exc)[:200]}})
 

@@ -188,8 +188,12 @@ def set_sheet_marked(phone: str) -> None:
 
 
 def sent_get(phone: str) -> dict[str, Any] | None:
+    from evolution_client import phone_variants
+
+    variants = phone_variants(phone) | {phone}
     with _lock:
-        row = conn().execute("SELECT phone, sheet, row, sent_at, sheet_marked FROM sent_log WHERE phone=?", (phone,)).fetchone()
+        q = "SELECT phone, sheet, row, sent_at, sheet_marked FROM sent_log WHERE phone IN (%s)" % ",".join("?" * len(variants))
+        row = conn().execute(q, tuple(variants)).fetchone()
     if not row:
         return None
     return {"phone": row[0], "sheet": row[1], "row": row[2], "sent_at": row[3], "sheet_marked": bool(row[4])}

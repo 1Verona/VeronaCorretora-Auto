@@ -411,6 +411,10 @@ class SheetManager:
                 primeiro = (row.get("primeiro_contato_em", "") or "").strip()
                 if primeiro:
                     continue
+                # Linha já tratada (bloqueada/sem interesse/duplicada): antes continuava
+                # "pendente", era remarcada a cada ciclo (nota crescendo) e ocupava a fila.
+                if (row.get("estagio_conversa", "") or "").strip():
+                    continue
                 telefone = (row.get("telefone", "") or row.get("telefone_planilha", "") or "").strip()
                 if not telefone:
                     continue
@@ -440,6 +444,15 @@ class SheetManager:
             sheet_name, row, fields,
             status="PRIMEIRO CONTATO ENVIADO 📤" if template_used else "",
             note=f"Template usado: {template_used[:80]}" if template_used else "",
+            extra_columns=OUTREACH_COLUMNS,
+        )
+
+    @_serialized
+    def mark_duplicate_contact(self, sheet_name: str, row: int, reason: str = "") -> None:
+        """Mesmo telefone já recebeu a 1ª mensagem por outra linha/aba: não reenvia."""
+        self._write_row(
+            sheet_name, row, {"Estagio_conversa": "DUPLICADO"},
+            note=reason or "Telefone já contatado por outra linha — 1ª mensagem não reenviada",
             extra_columns=OUTREACH_COLUMNS,
         )
 
