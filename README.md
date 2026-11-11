@@ -41,6 +41,8 @@ cd frontend && npm ci && npm run dev   # painel em http://localhost:3000 (proxy 
 
 Testes: `pip install pytest && pytest -q`
 
+Simulação de um dia (tudo FICTÍCIO e mockado, sem rede): `python sim/simular_dia.py --json saida.json`
+
 ## Deploy (resumo)
 
 ```bash

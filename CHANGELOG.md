@@ -1,5 +1,55 @@
 # Changelog
 
+## [efficiency] — 2026-11-10
+
+Auditoria completa + otimizações de baixo risco. Regras de negócio (limite diário,
+rampa 10/20/30/50, janela, intervalo, opt-out) iguais ou mais rígidas.
+
+### Desempenho (medido com fake do Sheets que conta chamadas)
+- Planilha: cache curto de cabeçalho (`SHEETS_HEADER_TTL`, 60s) e da lista de abas (`SHEETS_LIST_TTL`, 300s);
+  campos + status + nota + follow-up numa única `batchUpdate`.
+  `mark_first_contact` / `mark_meeting_scheduled` / `mark_not_interested`: 7 → 2 chamadas; `update_stage`: 3 → 1;
+  leitura da fila (cache quente): 2 → 1.
+- Leituras de todas as abas (busca por telefone, Telegram: cliente/follow-ups/estatísticas) numa só `values.batchGet`.
+- Estágio da conversa só é gravado na planilha quando muda (antes: 1 escrita por mensagem do lead).
+- Webhook: dedup por id da mensagem (Evolution reenvia em timeout) → sem IA/resposta em dobro.
+- CNPJ/BigQuery: consulta principal não roda de novo se o snapshot da Receita é o mesmo (`cnpj_force` força).
+- Evolution e Telegram→API com `requests.Session` (keep-alive). Config do agente com cache por mtime.
+- SQLite: `synchronous=NORMAL` com WAL, índices novos, contagem de bloqueados sem carregar a lista.
+- Painel: não faz polling com a aba do navegador oculta.
+
+### Correções (bugs reais)
+- **Disparo duplicado**: se a planilha falhava após o envio, o lead recebia a 1ª mensagem de novo; agora há
+  registro local (`sent_log`) e a linha é marcada depois. Mesmo telefone em duas abas (OSM + CNPJ) recebe 1 vez (linha marcada `DUPLICADO`).
+- **Corrida no limite**: laço + "disparar agora"/Telegram podiam pegar o mesmo lead e passar do limite; envio serializado e limite revalidado dentro do lock.
+- **"Disparar agora" ignorava o limite diário/rampa**; agora respeita (janela continua livre para teste).
+- **Pausa por erros ficava presa para sempre** (gravada no banco, sem como zerar): `POST /outreach/reset-errors` e "iniciar disparo" zeram.
+- Linhas bloqueadas/sem interesse continuavam "pendentes": eram remarcadas a cada ciclo (nota crescendo) e podiam travar a fila.
+- **Telegram quebrado desde o hardening**: o bot chamava a própria API sem token (401); agora usa token interno.
+- Salvar Evolution pelo painel não tinha efeito até reiniciar (padrões congelados no import) e as respostas do webhook usavam o cliente antigo.
+- Lock global do webhook segurava todos os leads durante a busca na planilha → lock por telefone.
+- Pausa feita pelo corretor enquanto a IA respondia era desfeita / a IA respondia mesmo assim.
+- IA fora do ar → 500 e reenvio da Evolution; agora guarda a mensagem e avisa no Telegram.
+- Estágio inválido vindo da IA era gravado; agendamento aceitava horário passado e podia duplicar evento.
+- Alertas do Telegram com `_`/`*` no texto do lead falhavam em silêncio (Markdown); agora reenvia em texto puro.
+- Leadgen: exceção deixava "busca em andamento" para sempre; aba ignorava a UF configurada.
+- Saudação "Olá Advocacia!" / "Olá SOCIEDADE!" para leads de escritório → "Prezado(a)"; nomes em CAIXA ALTA capitalizados.
+- Horários de status/nota no fuso `TZ` (antes: fuso do servidor; no Docker, UTC).
+
+### Segurança
+- **Telegram sem controle de acesso**: qualquer pessoa que achasse o bot consultava leads e disparava; agora
+  `TELEGRAM_ALLOWED_CHAT_IDS` (ou o dono já registrado). Alertas iam para "o 1º chat que falou com o bot".
+- Telegram com TLS verificado (era `verify=False`).
+- Rate limit do login burlável forjando `X-Forwarded-For`; agora só confia no header vindo do proxy.
+- `POST /evolution/config` permitia injetar linhas no `.env` (ex.: trocar `ADMIN_PASSWORD`).
+- Validação da config de disparo (janela, limite 1–1000, intervalo mínimo 10s, rampa positiva).
+- Configs JSON com escrita atômica.
+
+### Testes / ferramentas
+- 28 → 55 testes (pytest, ~1,6 s). Fakes de Sheets/Calendar com contador (`tests/fake_google.py`).
+- `sim/simular_dia.py`: simulação reproduzível de um dia inteiro com dados FICTÍCIOS e tudo mockado.
+- pyflakes limpo; build do painel (Vite) ok.
+
 ## [hardening] — 2026-10-29
 
 ### Segurança
