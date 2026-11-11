@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import threading
 from pathlib import Path
@@ -142,6 +143,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
 CONFIG_FIELDS = set(DEFAULT_CONFIG.keys())
 
 _lock = threading.Lock()
+# Cache por mtime: a config era relida/parseada do disco 4-5x por mensagem do lead.
+_cache: tuple[float, dict[str, Any]] | None = None
 
 
 def _merge(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
@@ -174,21 +177,36 @@ def _merge(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_config() -> dict[str, Any]:
+    global _cache
     if not CONFIG_PATH.exists():
         merged = _merge(DEFAULT_CONFIG, {})
         save_config(merged)
         return merged
     try:
+        mtime = CONFIG_PATH.stat().st_mtime_ns
+    except OSError:
+        mtime = None
+    cached = _cache
+    if cached is not None and mtime is not None and cached[0] == mtime:
+        return copy.deepcopy(cached[1])
+    try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
         data = {}
-    return _merge(DEFAULT_CONFIG, data)
+    merged = _merge(DEFAULT_CONFIG, data)
+    if mtime is not None:
+        _cache = (mtime, merged)
+    return copy.deepcopy(merged)
 
 
 def save_config(config: dict[str, Any]) -> dict[str, Any]:
+    global _cache
     merged = _merge(DEFAULT_CONFIG, config or {})
     with _lock:
-        CONFIG_PATH.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp = CONFIG_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(CONFIG_PATH)  # escrita atômica: leitor nunca vê arquivo pela metade
+        _cache = None
     return merged
 
 

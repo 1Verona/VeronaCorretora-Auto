@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 import osm_leads
 import cnpj_leads
+import storage
 from sheets_config import load_config as load_sheets_config
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -23,6 +24,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "osm_area": "BR-SC",
     "cnpj_uf": "SC",
     "cnpj_cnae": "6911701",
+    # True = refaz a consulta do CNPJ mesmo sem snapshot novo
+    "cnpj_force": False,
 }
 
 CONFIG_FIELDS = set(DEFAULT_CONFIG.keys())
@@ -45,7 +48,9 @@ def load_config() -> dict[str, Any]:
 
 def save_config(config: dict[str, Any]) -> dict[str, Any]:
     merged = {**DEFAULT_CONFIG, **{k: v for k, v in config.items() if k in CONFIG_FIELDS}}
-    CONFIG_PATH.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(CONFIG_PATH)  # atômico: o loop nunca lê arquivo pela metade
     return merged
 
 
@@ -96,24 +101,27 @@ class LeadGenWorker:
                 return {"ok": False, "error": "Já existe uma busca de leads em andamento."}
             self._running = True
 
-        config = load_config()
-        spreadsheet_id = (load_sheets_config().get("spreadsheet_id") or "").strip()
         result: dict[str, Any] = {}
-
-        if config.get("run_osm", True):
-            result["osm"] = self._run_osm(config, spreadsheet_id)
-        if config.get("run_cnpj", True):
-            result["cnpj"] = self._run_cnpj(config, spreadsheet_id)
-
-        with self._lock:
-            self._running = False
-            self._last_run_at = datetime.now().isoformat(timespec="seconds")
-            self._last_result = result
+        try:
+            config = load_config()
+            spreadsheet_id = (load_sheets_config().get("spreadsheet_id") or "").strip()
+            if config.get("run_osm", True):
+                result["osm"] = self._run_osm(config, spreadsheet_id)
+            if config.get("run_cnpj", True):
+                result["cnpj"] = self._run_cnpj(config, spreadsheet_id)
+        finally:
+            # antes: uma exceção aqui deixava _running=True para sempre (busca travada)
+            with self._lock:
+                self._running = False
+                self._last_run_at = datetime.now().isoformat(timespec="seconds")
+                self._last_result = result
 
         return {"ok": True, "result": result}
 
     def _run_osm(self, config: dict[str, Any], spreadsheet_id: str) -> dict[str, Any]:
-        argv = ["--area", str(config.get("osm_area", "BR-SC"))]
+        area = str(config.get("osm_area", "BR-SC"))
+        # aba segue a UF configurada (antes ia sempre para Leads_OSM_SC)
+        argv = ["--area", area, "--output-sheet", f"Leads_OSM_{area.split('-')[-1].upper()}"]
         if spreadsheet_id:
             argv += ["--spreadsheet-id", spreadsheet_id]
         try:
@@ -128,7 +136,8 @@ class LeadGenWorker:
             return {"ok": False, "error": str(exc)}
 
     def _run_cnpj(self, config: dict[str, Any], spreadsheet_id: str) -> dict[str, Any]:
-        argv = ["--uf", str(config.get("cnpj_uf", "SC")), "--cnae", str(config.get("cnpj_cnae", "6911701"))]
+        uf = str(config.get("cnpj_uf", "SC")).strip().upper()
+        argv = ["--uf", uf, "--cnae", str(config.get("cnpj_cnae", "6911701")), "--output-sheet", f"Leads_CNPJ_{uf}"]
         if spreadsheet_id:
             argv += ["--spreadsheet-id", spreadsheet_id]
         try:
@@ -138,6 +147,13 @@ class LeadGenWorker:
             data_emp = cnpj_leads.latest_data_date(client, cnpj_leads.EMP_TABLE)
             if data_est is None or data_emp is None:
                 return {"ok": False, "error": "Snapshot de CNPJ não encontrado."}
+
+            # A base da Receita muda ~1x/mês; rodar a consulta principal todo dia
+            # gastava cota do BigQuery para devolver os mesmos leads (já deduplicados).
+            snap_key = f"cnpj_last_snapshot:{args.uf}:{','.join(sorted(args.cnae))}:{args.output_sheet}"
+            snap_val = f"{data_est.isoformat()}|{data_emp.isoformat()}"
+            if storage.kv_get(snap_key) == snap_val and not config.get("cnpj_force"):
+                return {"ok": True, "skipped": True, "reason": "snapshot já processado", "snapshot": data_est.isoformat(), "added": 0}
 
             from google.cloud import bigquery
 
@@ -156,6 +172,7 @@ class LeadGenWorker:
 
             service = cnpj_leads.build_sheets_service(args.credentials)
             write_result = cnpj_leads.write_leads_sheet(service, args.spreadsheet_id, args.output_sheet, cnpj_leads.HEADERS, rows, "CNPJ")
+            storage.kv_set(snap_key, snap_val)
             return {"ok": True, "snapshot": data_est.isoformat(), **write_result}
         except Exception as exc:
             traceback.print_exc()
