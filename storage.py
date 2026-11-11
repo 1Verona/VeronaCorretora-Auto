@@ -18,12 +18,17 @@ BASE_DIR = Path(__file__).resolve().parent
 _lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
 _conn_path: str | None = None
+_seen_inserts = 0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (phone TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS blocklist (phone TEXT PRIMARY KEY, reason TEXT, created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS daily_counters (day TEXT PRIMARY KEY, sent INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sent_log (phone TEXT PRIMARY KEY, sheet TEXT, row INTEGER, sent_at REAL NOT NULL, sheet_marked INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS processed_messages (msg_id TEXT PRIMARY KEY, seen_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_processed_seen ON processed_messages(seen_at);
+CREATE INDEX IF NOT EXISTS idx_daily_sent ON daily_counters(sent);
 """
 
 
@@ -39,7 +44,10 @@ def conn() -> sqlite3.Connection:
             if path != ":memory:":
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
             _conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
-            _conn.execute("PRAGMA journal_mode=WAL") if path != ":memory:" else None
+            if path != ":memory:":
+                _conn.execute("PRAGMA journal_mode=WAL")
+                # WAL + NORMAL: durável o bastante e evita fsync a cada commit
+                _conn.execute("PRAGMA synchronous=NORMAL")
             _conn.executescript(SCHEMA)
             _conn_path = path
             _migrate_json_conversations(_conn)
@@ -118,6 +126,11 @@ def is_blocked(phone: str) -> bool:
         return c.execute(q, tuple(variants)).fetchone() is not None
 
 
+def count_blocked() -> int:
+    with _lock:
+        return int(conn().execute("SELECT COUNT(*) FROM blocklist").fetchone()[0])
+
+
 def list_blocked() -> list[dict[str, Any]]:
     with _lock:
         rows = conn().execute("SELECT phone, reason, created_at FROM blocklist ORDER BY created_at DESC").fetchall()
@@ -135,8 +148,9 @@ def incr_sent(day: str) -> int:
     with _lock:
         c = conn()
         c.execute("INSERT INTO daily_counters(day, sent) VALUES (?,1) ON CONFLICT(day) DO UPDATE SET sent=sent+1", (day,))
+        row = c.execute("SELECT sent FROM daily_counters WHERE day=?", (day,)).fetchone()
         c.commit()
-    return get_sent(day)
+    return int(row[0])
 
 
 def active_send_days() -> int:
@@ -144,6 +158,59 @@ def active_send_days() -> int:
     with _lock:
         row = conn().execute("SELECT COUNT(*) FROM daily_counters WHERE sent > 0").fetchone()
     return int(row[0])
+
+
+# ---- registro local de envios (evita reenviar se a planilha falhar) ----
+def record_sent(phone: str, sheet: str, row: int, sheet_marked: bool) -> None:
+    with _lock:
+        c = conn()
+        c.execute(
+            "INSERT OR REPLACE INTO sent_log(phone, sheet, row, sent_at, sheet_marked) VALUES (?,?,?,?,?)",
+            (phone, sheet, row, time.time(), 1 if sheet_marked else 0),
+        )
+        c.commit()
+
+
+def was_sent(phone: str) -> bool:
+    from evolution_client import phone_variants
+
+    variants = phone_variants(phone) | {phone}
+    with _lock:
+        q = "SELECT 1 FROM sent_log WHERE phone IN (%s)" % ",".join("?" * len(variants))
+        return conn().execute(q, tuple(variants)).fetchone() is not None
+
+
+def set_sheet_marked(phone: str) -> None:
+    with _lock:
+        c = conn()
+        c.execute("UPDATE sent_log SET sheet_marked=1 WHERE phone=?", (phone,))
+        c.commit()
+
+
+def sent_get(phone: str) -> dict[str, Any] | None:
+    with _lock:
+        row = conn().execute("SELECT phone, sheet, row, sent_at, sheet_marked FROM sent_log WHERE phone=?", (phone,)).fetchone()
+    if not row:
+        return None
+    return {"phone": row[0], "sheet": row[1], "row": row[2], "sent_at": row[3], "sheet_marked": bool(row[4])}
+
+
+# ---- deduplicação de webhooks (Evolution reenvia em timeout) ----
+def mark_message_seen(msg_id: str, ttl_seconds: float = 3 * 86400) -> bool:
+    """Registra o id; devolve False se já tinha sido visto (duplicado)."""
+    if not msg_id:
+        return True
+    now = time.time()
+    with _lock:
+        c = conn()
+        cur = c.execute("INSERT OR IGNORE INTO processed_messages(msg_id, seen_at) VALUES (?,?)", (msg_id, now))
+        fresh = cur.rowcount == 1
+        global _seen_inserts
+        _seen_inserts += 1
+        if _seen_inserts % 200 == 0:  # poda periódica, sem custo por mensagem
+            c.execute("DELETE FROM processed_messages WHERE seen_at < ?", (now - ttl_seconds,))
+        c.commit()
+    return fresh
 
 
 # ---- kv ----

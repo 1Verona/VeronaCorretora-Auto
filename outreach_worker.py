@@ -72,7 +72,9 @@ def load_config() -> dict[str, Any]:
 
 def save_config(config: dict[str, Any]) -> dict[str, Any]:
     merged = {**DEFAULT_CONFIG, **{k: v for k, v in config.items() if k in CONFIG_FIELDS}}
-    CONFIG_PATH.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(CONFIG_PATH)  # atômico: o loop nunca lê arquivo pela metade
     return merged
 
 
@@ -129,6 +131,9 @@ class OutreachWorker:
         self.conversation_hook = conversation_hook or (lambda _lead: None)
 
         self._lock = threading.Lock()
+        # Um envio por vez (loop, botão "disparar agora" e Telegram não podem
+        # pegar o mesmo lead ao mesmo tempo nem furar o limite diário).
+        self._send_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._consecutive_errors = int(storage.kv_get("consecutive_errors", 0) or 0)
@@ -183,7 +188,7 @@ class OutreachWorker:
                 "daily_limit": int(config.get("daily_limit", 50)),
                 "effective_daily_limit": effective_daily_limit(config, now.date()),
                 "consecutive_errors": self._consecutive_errors,
-                "blocked_count": len(storage.list_blocked()),
+                "blocked_count": storage.count_blocked(),
                 "queue_size": queue_size,
                 "next_dispatch_in_seconds": next_dispatch,
                 "paused_reason": self._paused_reason,
@@ -205,7 +210,14 @@ class OutreachWorker:
         self._set_errors(0)
 
     def dispatch_one_now(self) -> dict[str, Any]:
+        """Envio manual: ignora janela/intervalo, mas respeita limite diário (com rampa),
+        lista de bloqueio e pausa por erros consecutivos."""
         config = load_config()
+        today = datetime.now(TZ).date()
+        if storage.get_sent(today.isoformat()) >= effective_daily_limit(config, today):
+            return {"sent": False, "error": "limite diário atingido"}
+        if self._consecutive_errors >= int(config.get("max_consecutive_errors", 3)):
+            return {"sent": False, "error": f"pausado após {self._consecutive_errors} erros consecutivos (zere os erros antes)"}
         return self._send_one(config, force=True)
 
     def _loop(self) -> None:
@@ -257,13 +269,18 @@ class OutreachWorker:
                 self._sleep(15)
 
     def _send_one(self, config: dict[str, Any], force: bool = False) -> dict[str, Any]:
+        with self._send_lock:
+            return self._send_one_locked(config, force)
+
+    def _send_one_locked(self, config: dict[str, Any], force: bool = False) -> dict[str, Any]:
         if not self.evolution.configured:
             self._paused_reason = "Evolution não configurado"
             return {"sent": False, "error": "evolution_not_configured"}
 
         source = (load_sheets_config().get("source_sheet") or "").strip() or None
         agent_cfg = load_agent_config()
-        if agent_cfg.get("test_mode"):
+        test_mode = bool(agent_cfg.get("test_mode"))
+        if test_mode:
             test_phone = normalize_phone(agent_cfg.get("test_phone") or "")
             if not test_phone:
                 self._paused_reason = "modo de teste sem número configurado"
@@ -275,7 +292,12 @@ class OutreachWorker:
 
         lead = None
         for cand in candidates:
-            if storage.is_blocked(normalize_phone(cand.get("telefone", ""))):
+            phone_norm = normalize_phone(cand.get("telefone", ""))
+            if not test_mode and storage.was_sent(phone_norm):
+                # Já recebeu (a planilha não foi marcada da outra vez): só tenta marcar de novo.
+                self._repair_sheet_mark(cand, phone_norm)
+                continue
+            if storage.is_blocked(phone_norm):
                 try:
                     self.sheet_manager.mark_not_interested(cand["sheet"], cand["row"], "opt-out (lista de bloqueio)")
                 except Exception:
@@ -310,6 +332,8 @@ class OutreachWorker:
 
         self._set_errors(0)
         now = datetime.now(TZ)
+        phone_norm = normalize_phone(lead["telefone"])
+        marked = False
         try:
             self.sheet_manager.mark_first_contact(
                 sheet_name=lead["sheet"],
@@ -318,9 +342,12 @@ class OutreachWorker:
                 template_used=template,
                 jid=to_jid(lead["telefone"]),
             )
+            marked = True
         except Exception as exc:
             self._last_error = f"falha ao atualizar planilha: {exc}"
             log.error("falha ao atualizar planilha após envio", extra={"ctx": {"error": str(exc)[:200]}})
+        # registro local: garante que o lead não recebe a 1ª mensagem duas vezes
+        storage.record_sent(phone_norm, lead.get("sheet", ""), int(lead.get("row") or 0), marked)
 
         with self._lock:
             self._sent_today = storage.incr_sent(now.date().isoformat())
@@ -333,6 +360,19 @@ class OutreachWorker:
             pass
 
         return {"sent": True, "lead": lead, "template": template}
+
+    def _repair_sheet_mark(self, cand: dict[str, Any], phone_norm: str) -> None:
+        info = storage.sent_get(phone_norm) or {}
+        if info.get("sheet_marked"):
+            return
+        try:
+            when = datetime.fromtimestamp(float(info.get("sent_at") or time.time()), TZ)
+            self.sheet_manager.mark_first_contact(
+                sheet_name=cand["sheet"], row=cand["row"], when=when, template_used="", jid=to_jid(cand["telefone"]),
+            )
+            storage.set_sheet_marked(phone_norm)
+        except Exception as exc:
+            log.warning("planilha ainda sem marcar lead já contatado", extra={"ctx": {"error": str(exc)[:200]}})
 
     def _sleep(self, seconds: float) -> None:
         end = time.time() + seconds
