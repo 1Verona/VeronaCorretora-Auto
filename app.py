@@ -20,12 +20,8 @@ from lead_gen_worker import load_config as load_leadgen_config, save_config as s
 from outreach_worker import OutreachWorker, load_config, save_config
 from scraper import (
     DEFAULT_CREDENTIALS_PATH,
-    DEFAULT_OUTPUT_SHEET,
-    DEFAULT_SECCIONAL,
-    DEFAULT_SPREADSHEET_ID,
     ScraperConfig,
     allowed_credential_file,
-    apply_priority,
     build_sheets_service,
     cleanup_cache,
     count_leads_per_sheet,
@@ -114,7 +110,10 @@ def _write_env_file(values: dict[str, str]) -> None:
 def _reload_evolution_client() -> None:
     """Recria o EvolutionClient com os valores atuais do os.environ."""
     from evolution_client import EvolutionClient
+    import conversation_engine
+
     outreach_worker.evolution = EvolutionClient()
+    conversation_engine._evolution = EvolutionClient()  # respostas do webhook também usam a nova config
 
 
 def find_free_port(start: int = 5050, max_attempts: int = 10) -> int:
@@ -203,9 +202,29 @@ def check_auth():
     return None
 
 
+def _client_ip() -> str:
+    """IP do cliente para rate limit. Só confia em X-Forwarded-For quando a conexão
+    vem do proxy local (Caddy em 127.0.0.1); usa o último salto, que o proxy escreve.
+    Antes: o 1º valor do header (forjável) permitia burlar o limite de tentativas."""
+    import ipaddress
+
+    remote = request.remote_addr or "?"
+    xff = request.headers.get("X-Forwarded-For", "")
+    if not xff:
+        return remote
+    try:
+        ip = ipaddress.ip_address(remote)
+        from_proxy = ip.is_loopback or ip.is_private  # Caddy no host / rede do Docker
+    except ValueError:
+        from_proxy = False
+    if from_proxy or os.getenv("TRUST_PROXY_HEADERS") == "1":
+        return xff.split(",")[-1].strip() or remote
+    return remote
+
+
 @app.post("/login")
 def login():
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
+    ip = _client_ip()
     if not _login_limiter.hit(ip):
         log.warning("login bloqueado por rate limit", extra={"ctx": {"ip": ip}})
         return jsonify({"ok": False, "error": "Muitas tentativas. Aguarde alguns minutos."}), 429
@@ -345,6 +364,8 @@ telegram_bot = TelegramBot(
     token=TELEGRAM_BOT_TOKEN,
     flask_url="http://127.0.0.1:5050",
 )
+# O bot chama a própria API (que agora exige login): token interno de curta duração
+telegram_bot.api_token_provider = lambda: _tokens.issue("telegram-bot")
 
 
 def _notify_broker(text: str) -> None:
@@ -602,10 +623,33 @@ def outreach_set_config():
         for int_field in ("hour_start", "hour_end", "daily_limit", "min_delay", "max_delay", "max_consecutive_errors"):
             if int_field in merged:
                 merged[int_field] = int(merged[int_field])
+        problem = _validate_outreach_config(merged)
+        if problem:
+            return jsonify({"error": problem}), 400
         saved = save_config(merged)
         return jsonify({"ok": True, "config": saved})
     except (TypeError, ValueError) as exc:
         return jsonify({"error": f"Valor inválido: {exc}"}), 400
+
+
+def _validate_outreach_config(c: dict[str, Any]) -> str:
+    """Barra valores que desligariam as travas de segurança do disparo."""
+    if not (0 <= c.get("hour_start", 9) < c.get("hour_end", 18) <= 24):
+        return "Janela inválida: 0 <= início < fim <= 24"
+    if not (1 <= c.get("daily_limit", 50) <= 1000):
+        return "daily_limit precisa estar entre 1 e 1000"
+    if c.get("min_delay", 60) < 10 or c.get("max_delay", 180) < c.get("min_delay", 60):
+        return "Intervalo inválido: min_delay >= 10s e max_delay >= min_delay"
+    if c.get("max_consecutive_errors", 3) < 1:
+        return "max_consecutive_errors precisa ser >= 1"
+    sched = c.get("warmup_schedule")
+    if sched is not None:
+        try:
+            if not isinstance(sched, list) or any(int(x) <= 0 for x in sched):
+                return "warmup_schedule precisa ser lista de números positivos"
+        except (TypeError, ValueError):
+            return "warmup_schedule precisa ser lista de números positivos"
+    return ""
 
 
 @app.post("/outreach/start")
@@ -713,7 +757,8 @@ def sheets_set_config():
 @app.get("/evolution/config")
 def evolution_get_config():
     """Retorna as configura\u00e7\u00f5es atuais da Evolution (mascarando a API key)."""
-    env = _read_env_file()
+    file_env = _read_env_file()
+    env = {k: (file_env.get(k) or os.getenv(k, "")) for k in ("EVOLUTION_API_KEY", "EVOLUTION_API_URL", "EVOLUTION_INSTANCE", "EVOLUTION_WEBHOOK_TOKEN")}
     api_key = env.get("EVOLUTION_API_KEY", "")
     masked_key = (api_key[:6] + "***") if len(api_key) > 6 else ("***" if api_key else "")
     from evolution_client import EvolutionClient
@@ -735,7 +780,6 @@ def evolution_set_config():
     if not isinstance(payload, dict):
         return jsonify({"error": "Formato inv\u00e1lido"}), 400
 
-    allowed = {"evolution_api_url", "evolution_api_key", "evolution_instance", "evolution_webhook_token"}
     updates: dict[str, str] = {}
 
     if "evolution_api_url" in payload:
@@ -752,6 +796,9 @@ def evolution_set_config():
 
     if not updates:
         return jsonify({"error": "Nenhum campo v\u00e1lido enviado"}), 400
+    if any(("\n" in v or "\r" in v) for v in updates.values()):
+        # evita injetar linhas extras no .env (ex.: trocar ADMIN_PASSWORD)
+        return jsonify({"error": "Valores não podem conter quebra de linha"}), 400
 
     # Salva no .env
     _write_env_file(updates)

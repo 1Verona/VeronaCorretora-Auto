@@ -72,6 +72,10 @@ class RateLimiter:
             q = self._hits[key]
             while q and now - q[0] > self.window:
                 q.popleft()
+            if len(self._hits) > 10000:  # poda IPs antigos (memória não cresce sem limite)
+                for k in [k for k, v in self._hits.items() if not v or now - v[-1] > self.window]:
+                    self._hits.pop(k, None)
+                q = self._hits[key]
             if len(q) >= self.max:
                 return False
             q.append(now)
