@@ -10,17 +10,29 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from evolution_client import normalize_phone, phone_variants
+from evolution_client import phone_variants
 from scraper import DEFAULT_CREDENTIALS_PATH, DEFAULT_SPREADSHEET_ID, SCOPES
 
 import functools
 import os
 import threading
+import time
+
+import pytz
 
 # Escritas na planilha: serializadas por lock (evita corrida entre disparo,
 # webhook e bot) e com retry exponencial nativo do googleapiclient (429/5xx).
 SHEETS_RETRIES = int(os.getenv("SHEETS_RETRIES", "4"))
+# Cache curto de cabeçalhos/abas: evita 3-5 leituras repetidas por escrita.
+# Curto de propósito: se alguém inserir coluna na mão, em <= TTL volta a ler.
+SHEETS_HEADER_TTL = float(os.getenv("SHEETS_HEADER_TTL", "60"))
+SHEETS_LIST_TTL = float(os.getenv("SHEETS_LIST_TTL", "300"))
+TZ = pytz.timezone(os.getenv("TZ", "America/Sao_Paulo") or "America/Sao_Paulo")
 _write_lock = threading.RLock()
+
+
+def _now_str() -> str:
+    return datetime.now(TZ).strftime("%d/%m/%Y %H:%M")
 
 
 def _serialized(fn):
@@ -48,6 +60,17 @@ class SheetManager:
         self.credentials_path = credentials_path
         self.spreadsheet_id = spreadsheet_id
         self._service = None
+        self._headers_cache: dict[str, tuple[float, list[str]]] = {}
+        self._sheets_cache: tuple[float, list[str]] | None = None
+        self._cache_lock = threading.Lock()
+
+    def invalidate_cache(self, sheet_name: str | None = None) -> None:
+        with self._cache_lock:
+            if sheet_name is None:
+                self._headers_cache.clear()
+                self._sheets_cache = None
+            else:
+                self._headers_cache.pop(sheet_name, None)
 
     @property
     def service(self):
@@ -56,23 +79,26 @@ class SheetManager:
             self._service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
         return self._service
 
-    def list_sheets(self) -> list[str]:
+    def list_sheets(self, fresh: bool = False) -> list[str]:
+        with self._cache_lock:
+            cached = self._sheets_cache
+        if not fresh and cached and time.time() - cached[0] < SHEETS_LIST_TTL:
+            return list(cached[1])
         metadata = self.service.spreadsheets().get(
             spreadsheetId=self.spreadsheet_id,
             fields="sheets.properties.title",
         ).execute(num_retries=SHEETS_RETRIES)
-        return [s["properties"]["title"] for s in metadata.get("sheets", [])]
+        titles = [s["properties"]["title"] for s in metadata.get("sheets", [])]
+        with self._cache_lock:
+            self._sheets_cache = (time.time(), titles)
+        return list(titles)
 
-    def get_all_rows_from_sheet(self, sheet_name: str) -> list[dict[str, Any]]:
-        result = self.service.spreadsheets().values().get(
-            spreadsheetId=self.spreadsheet_id,
-            range=sheet_name,
-        ).execute(num_retries=SHEETS_RETRIES)
-        values = result.get("values", [])
+    def _rows_from_values(self, sheet_name: str, values: list[list[str]]) -> list[dict[str, Any]]:
         if not values:
             return []
-
         headers = [h.lower().strip() for h in values[0]]
+        with self._cache_lock:
+            self._headers_cache[sheet_name] = (time.time(), headers)
         rows = []
         for i, row in enumerate(values[1:], start=2):
             row_dict = {"_row": i, "_sheet": sheet_name}
@@ -81,14 +107,33 @@ class SheetManager:
             rows.append(row_dict)
         return rows
 
+    def iter_all_rows(self) -> list[tuple[str, list[dict[str, Any]]]]:
+        """Lê todas as abas numa única chamada (values.batchGet) em vez de 1 por aba."""
+        sheets = self.list_sheets()
+        if not sheets:
+            return []
+        result = self.service.spreadsheets().values().batchGet(
+            spreadsheetId=self.spreadsheet_id,
+            ranges=sheets,
+        ).execute(num_retries=SHEETS_RETRIES)
+        out = []
+        for sheet, vr in zip(sheets, result.get("valueRanges", [])):
+            out.append((sheet, self._rows_from_values(sheet, vr.get("values", []))))
+        return out
+
+    def get_all_rows_from_sheet(self, sheet_name: str) -> list[dict[str, Any]]:
+        result = self.service.spreadsheets().values().get(
+            spreadsheetId=self.spreadsheet_id,
+            range=sheet_name,
+        ).execute(num_retries=SHEETS_RETRIES)
+        return self._rows_from_values(sheet_name, result.get("values", []))
+
     def find_client(self, name: str, *, threshold: float = 0.6, max_results: int = 5) -> list[dict[str, Any]]:
         name_lower = name.lower().strip()
         name_parts = set(name_lower.split())
-        sheets = self.list_sheets()
         results: list[dict[str, Any]] = []
 
-        for sheet in sheets:
-            rows = self.get_all_rows_from_sheet(sheet)
+        for sheet, rows in self.iter_all_rows():
             for row in rows:
                 row_name = (row.get("nome", "") or "").lower().strip()
                 if not row_name:
@@ -117,18 +162,33 @@ class SheetManager:
         results.sort(key=lambda x: x["score"], reverse=True)
         return results[:max_results]
 
-    @_serialized
-    def ensure_columns(self, sheet_name: str, required: list[str]) -> None:
+    def _headers(self, sheet_name: str, fresh: bool = False) -> list[str]:
+        """Cabeçalho (minúsculo) com cache curto (SHEETS_HEADER_TTL)."""
+        if not fresh and SHEETS_HEADER_TTL > 0:
+            with self._cache_lock:
+                cached = self._headers_cache.get(sheet_name)
+            if cached and time.time() - cached[0] < SHEETS_HEADER_TTL:
+                return list(cached[1])
         result = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
             range=f"{sheet_name}!A1:ZZ1",
         ).execute(num_retries=SHEETS_RETRIES)
-        values = result.get("values", [])
-        existing = [h.lower().strip() for h in (values[0] if values else [])]
+        headers = [h.lower().strip() for h in (result.get("values", [[]]) or [[]])[0]]
+        with self._cache_lock:
+            self._headers_cache[sheet_name] = (time.time(), headers)
+        return list(headers)
 
+    @_serialized
+    def ensure_columns(self, sheet_name: str, required: list[str]) -> list[str]:
+        """Garante as colunas e devolve o cabeçalho atualizado (minúsculo)."""
+        existing = self._headers(sheet_name)
         to_add = [c for c in required if c.lower() not in existing]
+        if to_add:
+            # antes de criar coluna, confirma com leitura fresca (cache pode estar velho)
+            existing = self._headers(sheet_name, fresh=True)
+            to_add = [c for c in required if c.lower() not in existing]
         if not to_add:
-            return
+            return existing
 
         start_col = len(existing) + 1
         end_col = start_col + len(to_add) - 1
@@ -142,58 +202,65 @@ class SheetManager:
             valueInputOption="RAW",
             body={"values": [to_add]},
         ).execute(num_retries=SHEETS_RETRIES)
+        headers = existing + [c.lower().strip() for c in to_add]
+        with self._cache_lock:
+            self._headers_cache[sheet_name] = (time.time(), headers)
+        return list(headers)
 
     @_serialized
-    def update_client_status(self, sheet_name: str, row: int, status: str, notes: str = "", follow_up_date: str = "") -> dict[str, Any]:
-        self.ensure_columns(sheet_name, ["Status", "Notas", "Follow-up"])
+    def _write_row(
+        self,
+        sheet_name: str,
+        row: int,
+        fields: dict[str, str] | None = None,
+        *,
+        status: str = "",
+        note: str = "",
+        follow_up_date: str = "",
+        extra_columns: list[str] | None = None,
+    ) -> None:
+        """Escreve campos + status/nota/follow-up numa única batchUpdate.
 
-        result = self.service.spreadsheets().values().get(
-            spreadsheetId=self.spreadsheet_id,
-            range=f"{sheet_name}!A1:ZZ1",
-        ).execute(num_retries=SHEETS_RETRIES)
-        headers = [h.lower().strip() for h in (result.get("values", [[]])[0])]
-
-        status_col = headers.index("status") + 1 if "status" in headers else None
-        notas_col = headers.index("notas") + 1 if "notas" in headers else None
-        followup_col = headers.index("follow-up") + 1 if "follow-up" in headers else None
-
+        Antes: cada mark_* fazia ~7 chamadas (3-5 leituras de cabeçalho repetidas,
+        2 batchUpdate). Agora: cabeçalho em cache + 1 leitura da nota (se houver) + 1 escrita.
+        """
+        required = list(extra_columns or [])
+        if status or note or follow_up_date:
+            required += ["Status", "Notas", "Follow-up"]
+        headers = self.ensure_columns(sheet_name, required) if required else self._headers(sheet_name)
         updates = []
-        now = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-        if status_col:
-            col_letter = self._col_index_to_letter(status_col)
-            updates.append({
-                "range": f"{sheet_name}!{col_letter}{row}",
-                "values": [[f"{status} ({now})"]],
-            })
+        def put(col_name: str, value: str) -> None:
+            key = col_name.lower().strip()
+            if key in headers:
+                letter = self._col_index_to_letter(headers.index(key) + 1)
+                updates.append({"range": f"{sheet_name}!{letter}{row}", "values": [[value]]})
 
-        if notas_col:
-            col_letter = self._col_index_to_letter(notas_col)
+        for name, value in (fields or {}).items():
+            put(name, value)
+        now = _now_str()
+        if status:
+            put("Status", f"{status} ({now})")
+        if note and "notas" in headers:
+            letter = self._col_index_to_letter(headers.index("notas") + 1)
             result = self.service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
-                range=f"{sheet_name}!{col_letter}{row}",
+                range=f"{sheet_name}!{letter}{row}",
             ).execute(num_retries=SHEETS_RETRIES)
-            current_notes = (result.get("values", [[]])[0][0] if result.get("values") else "")
-            new_note = f"[{now}] {notes}" if notes else ""
-            combined = f"{current_notes}\n{new_note}".strip() if current_notes else new_note
-            updates.append({
-                "range": f"{sheet_name}!{col_letter}{row}",
-                "values": [[combined]],
-            })
-
-        if followup_col and follow_up_date:
-            col_letter = self._col_index_to_letter(followup_col)
-            updates.append({
-                "range": f"{sheet_name}!{col_letter}{row}",
-                "values": [[follow_up_date]],
-            })
-
+            current = (result.get("values", [[]])[0][0] if result.get("values") else "")
+            new_note = f"[{now}] {note}"
+            put("Notas", f"{current}\n{new_note}".strip() if current else new_note)
+        if follow_up_date:
+            put("Follow-up", follow_up_date)
         if updates:
             self.service.spreadsheets().values().batchUpdate(
                 spreadsheetId=self.spreadsheet_id,
                 body={"valueInputOption": "RAW", "data": updates},
             ).execute(num_retries=SHEETS_RETRIES)
 
+    @_serialized
+    def update_client_status(self, sheet_name: str, row: int, status: str, notes: str = "", follow_up_date: str = "") -> dict[str, Any]:
+        self._write_row(sheet_name, row, status=status, note=notes, follow_up_date=follow_up_date)
         return {"updated": True, "sheet": sheet_name, "row": row, "status": status}
 
     def _col_index_to_letter(self, col_index: int) -> str:
@@ -229,7 +296,7 @@ class SheetManager:
         return None
 
     def list_followups(self, when: str = "today") -> list[dict[str, Any]]:
-        now = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        now = datetime.now(TZ).replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
         if when == "today":
             start, end = now, now + timedelta(days=1)
         elif when == "week":
@@ -240,8 +307,8 @@ class SheetManager:
             start, end = now, now + timedelta(days=7)
 
         results: list[dict[str, Any]] = []
-        for sheet in self.list_sheets():
-            for row in self.get_all_rows_from_sheet(sheet):
+        for sheet, rows in self.iter_all_rows():
+            for row in rows:
                 followup_raw = row.get("follow-up", "") or row.get("follow up", "") or row.get("followup", "")
                 if not followup_raw:
                     continue
@@ -263,7 +330,7 @@ class SheetManager:
         return results
 
     def get_stats(self, period: str = "month") -> dict[str, Any]:
-        now = datetime.now()
+        now = datetime.now(TZ).replace(tzinfo=None)
         if period == "month":
             cutoff = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         elif period == "week":
@@ -279,8 +346,8 @@ class SheetManager:
         recent_total = 0
         status_ts_re = re.compile(r"\((\d{2}/\d{2}/\d{4})")
 
-        for sheet in self.list_sheets():
-            for row in self.get_all_rows_from_sheet(sheet):
+        for sheet, rows in self.iter_all_rows():
+            for row in rows:
                 status_raw = (row.get("status", "") or "").strip()
                 if not status_raw:
                     continue
@@ -321,31 +388,11 @@ class SheetManager:
         return "outro"
 
     def _read_headers(self, sheet_name: str) -> list[str]:
-        result = self.service.spreadsheets().values().get(
-            spreadsheetId=self.spreadsheet_id,
-            range=f"{sheet_name}!A1:ZZ1",
-        ).execute(num_retries=SHEETS_RETRIES)
-        return [h.lower().strip() for h in (result.get("values", [[]])[0])]
+        return self._headers(sheet_name)
 
     @_serialized
     def _batch_update_row(self, sheet_name: str, row: int, fields: dict[str, str]) -> None:
-        headers = self._read_headers(sheet_name)
-        updates = []
-        for header_name, value in fields.items():
-            key = header_name.lower().strip()
-            if key not in headers:
-                continue
-            col_index = headers.index(key) + 1
-            col_letter = self._col_index_to_letter(col_index)
-            updates.append({
-                "range": f"{sheet_name}!{col_letter}{row}",
-                "values": [[value]],
-            })
-        if updates:
-            self.service.spreadsheets().values().batchUpdate(
-                spreadsheetId=self.spreadsheet_id,
-                body={"valueInputOption": "RAW", "data": updates},
-            ).execute(num_retries=SHEETS_RETRIES)
+        self._write_row(sheet_name, row, fields)
 
     def get_leads_pending_first_contact(
         self,
@@ -383,27 +430,22 @@ class SheetManager:
 
     @_serialized
     def mark_first_contact(self, sheet_name: str, row: int, when: datetime, template_used: str = "", jid: str = "") -> None:
-        self.ensure_columns(sheet_name, OUTREACH_COLUMNS)
-        timestamp = when.strftime("%d/%m/%Y %H:%M")
         fields = {
-            "Primeiro_contato_em": timestamp,
+            "Primeiro_contato_em": when.strftime("%d/%m/%Y %H:%M"),
             "Estagio_conversa": "ENGAGED",
         }
         if jid:
             fields["Evolution_jid"] = jid
-        self._batch_update_row(sheet_name, row, fields)
-        if template_used:
-            self.update_client_status(
-                sheet_name=sheet_name,
-                row=row,
-                status="PRIMEIRO CONTATO ENVIADO 📤",
-                notes=f"Template usado: {template_used[:80]}",
-            )
+        self._write_row(
+            sheet_name, row, fields,
+            status="PRIMEIRO CONTATO ENVIADO 📤" if template_used else "",
+            note=f"Template usado: {template_used[:80]}" if template_used else "",
+            extra_columns=OUTREACH_COLUMNS,
+        )
 
     @_serialized
     def update_stage(self, sheet_name: str, row: int, stage: str) -> None:
-        self.ensure_columns(sheet_name, OUTREACH_COLUMNS)
-        self._batch_update_row(sheet_name, row, {"Estagio_conversa": stage})
+        self._write_row(sheet_name, row, {"Estagio_conversa": stage}, extra_columns=OUTREACH_COLUMNS)
 
     @_serialized
     def mark_meeting_scheduled(
@@ -414,7 +456,6 @@ class SheetManager:
         meet_link: str = "",
         notes: str = "",
     ) -> None:
-        self.ensure_columns(sheet_name, OUTREACH_COLUMNS)
         timestamp = when.strftime("%d/%m/%Y %H:%M")
         fields = {
             "Reuniao_em": timestamp,
@@ -422,35 +463,32 @@ class SheetManager:
         }
         if meet_link:
             fields["Reuniao_link"] = meet_link
-        self._batch_update_row(sheet_name, row, fields)
         note_text = notes or f"Reunião agendada para {timestamp}"
         if meet_link:
             note_text = f"{note_text} — {meet_link}"
-        self.update_client_status(
-            sheet_name=sheet_name,
-            row=row,
+        self._write_row(
+            sheet_name, row, fields,
             status="REUNIÃO AGENDADA 📋",
-            notes=note_text,
+            note=note_text,
             follow_up_date=when.strftime("%d/%m/%Y"),
+            extra_columns=OUTREACH_COLUMNS,
         )
 
     @_serialized
     def mark_not_interested(self, sheet_name: str, row: int, reason: str = "") -> None:
-        self.ensure_columns(sheet_name, OUTREACH_COLUMNS)
-        self._batch_update_row(sheet_name, row, {"Estagio_conversa": "NOT_INTERESTED"})
-        self.update_client_status(
-            sheet_name=sheet_name,
-            row=row,
+        self._write_row(
+            sheet_name, row, {"Estagio_conversa": "NOT_INTERESTED"},
             status="SEM INTERESSE ❌",
-            notes=reason or "Lead encerrou conversa sem interesse",
+            note=reason or "Lead encerrou conversa sem interesse",
+            extra_columns=OUTREACH_COLUMNS,
         )
 
     def find_lead_by_phone(self, phone: str) -> dict[str, Any] | None:
         targets = phone_variants(phone)
         if not targets:
             return None
-        for sheet in self.list_sheets():
-            for row in self.get_all_rows_from_sheet(sheet):
+        for sheet, rows in self.iter_all_rows():
+            for row in rows:
                 row_variants = phone_variants(row.get("telefone", "") or row.get("telefone_planilha", ""))
                 if row_variants & targets:
                     return {
@@ -475,24 +513,17 @@ class SheetManager:
     ) -> dict[str, Any]:
         sheets = self.list_sheets()
         if sheet_name not in sheets:
+            sheets = self.list_sheets(fresh=True)
+        if sheet_name not in sheets:
             return {"added": False, "error": f"Aba '{sheet_name}' não existe. Abas: {sheets}"}
 
-        result = self.service.spreadsheets().values().get(
-            spreadsheetId=self.spreadsheet_id,
-            range=f"{sheet_name}!A1:ZZ1",
-        ).execute(num_retries=SHEETS_RETRIES)
-        headers = [h.lower().strip() for h in (result.get("values", [[]])[0])]
+        headers = self._headers(sheet_name, fresh=True)
         if not headers:
             return {"added": False, "error": f"Aba '{sheet_name}' sem cabeçalho."}
 
-        self.ensure_columns(sheet_name, ["Status", "Notas", "Follow-up"])
-        result = self.service.spreadsheets().values().get(
-            spreadsheetId=self.spreadsheet_id,
-            range=f"{sheet_name}!A1:ZZ1",
-        ).execute(num_retries=SHEETS_RETRIES)
-        headers = [h.lower().strip() for h in (result.get("values", [[]])[0])]
+        headers = self.ensure_columns(sheet_name, ["Status", "Notas", "Follow-up"])
 
-        now = datetime.now().strftime("%d/%m/%Y %H:%M")
+        now = _now_str()
         row_values = [""] * len(headers)
         field_map = {
             "nome": nome,
