@@ -210,14 +210,13 @@ class OutreachWorker:
         self._set_errors(0)
 
     def dispatch_one_now(self) -> dict[str, Any]:
-        """Envio manual: ignora janela/intervalo, mas respeita limite diário (com rampa),
-        lista de bloqueio e pausa por erros consecutivos."""
+        """Envio manual: ignora janela/intervalo, mas respeita limite diário (com rampa)
+        e lista de bloqueio. Continua permitido com pausa por erros (serve de teste:
+        um envio bem-sucedido zera os erros, como antes)."""
         config = load_config()
         today = datetime.now(TZ).date()
         if storage.get_sent(today.isoformat()) >= effective_daily_limit(config, today):
             return {"sent": False, "error": "limite diário atingido"}
-        if self._consecutive_errors >= int(config.get("max_consecutive_errors", 3)):
-            return {"sent": False, "error": f"pausado após {self._consecutive_errors} erros consecutivos (zere os erros antes)"}
         return self._send_one(config, force=True)
 
     def _loop(self) -> None:

@@ -657,8 +657,17 @@ def outreach_start():
     config = load_config()
     config["enabled"] = True
     save_config(config)
+    # ligar o disparo de novo = corretor revisou: zera a pausa por erros consecutivos
+    # (antes não havia como zerar; a pausa ficava gravada no banco para sempre)
+    outreach_worker.reset_errors()
     outreach_worker.start()
     return jsonify({"ok": True, "config": config})
+
+
+@app.post("/outreach/reset-errors")
+def outreach_reset_errors():
+    outreach_worker.reset_errors()
+    return jsonify({"ok": True})
 
 
 @app.post("/outreach/stop")

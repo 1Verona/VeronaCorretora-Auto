@@ -276,3 +276,12 @@ def test_leadgen_nao_fica_travado(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError):
         w.run_now()
     assert w.status()["running"] is False
+
+
+def test_reset_de_erros_pelo_painel(client, app_module):
+    from conftest import login
+    h = {"Authorization": f"Bearer {login(client)}"}
+    app_module.outreach_worker._set_errors(3)
+    assert client.post("/outreach/reset-errors", headers=h).status_code == 200
+    assert app_module.outreach_worker._consecutive_errors == 0
+    assert storage.kv_get("consecutive_errors") == 0
