@@ -73,15 +73,24 @@ class EvolutionError(Exception):
 class EvolutionClient:
     def __init__(
         self,
-        base_url: str = EVOLUTION_API_URL,
-        api_key: str = EVOLUTION_API_KEY,
-        instance: str = EVOLUTION_INSTANCE,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        instance: str | None = None,
         timeout: float = 20.0,
     ) -> None:
+        # Lê o ambiente na criação (antes os padrões eram congelados no import e
+        # salvar a config pelo painel não tinha efeito até reiniciar).
+        if base_url is None:
+            base_url = os.getenv("EVOLUTION_API_URL", "").strip()
+        if api_key is None:
+            api_key = os.getenv("EVOLUTION_API_KEY", "").strip()
+        if instance is None:
+            instance = os.getenv("EVOLUTION_INSTANCE", "").strip()
         self.base_url = (base_url or "").rstrip("/")
         self.api_key = api_key or ""
         self.instance = instance or ""
         self.timeout = timeout
+        self._session = requests.Session()  # keep-alive: sem novo handshake TLS a cada envio
 
     @property
     def configured(self) -> bool:
@@ -101,7 +110,7 @@ class EvolutionClient:
         if not self.configured:
             raise EvolutionError(0, "Evolution não configurado (.env)")
         url = f"{self.base_url}{path}"
-        resp = requests.post(url, headers=self._headers(), json=payload, timeout=self.timeout)
+        resp = self._session.post(url, headers=self._headers(), json=payload, timeout=self.timeout)
         if resp.status_code >= 400:
             raise EvolutionError(resp.status_code, resp.text)
         try:
@@ -113,7 +122,7 @@ class EvolutionClient:
         if not self.configured:
             raise EvolutionError(0, "Evolution não configurado (.env)")
         url = f"{self.base_url}{path}"
-        resp = requests.get(url, headers=self._headers(), timeout=self.timeout)
+        resp = self._session.get(url, headers=self._headers(), timeout=self.timeout)
         if resp.status_code >= 400:
             raise EvolutionError(resp.status_code, resp.text)
         try:
