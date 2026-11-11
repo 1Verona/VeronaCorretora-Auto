@@ -285,7 +285,7 @@ class TelegramBot:
         )
 
         if result.get("updated"):
-            msg = f"✅ *Atualizado!*\n\n"
+            msg = "✅ *Atualizado!*\n\n"
             msg += f"Cliente: *{candidate['nome']}*\n"
             msg += f"Status: {status_label}\n"
             if follow_up:

@@ -222,7 +222,7 @@ class FakeBQ:
         else:
             rows = []
             for i in range(self.n):
-                phone = (f"48", f"9000{1000 + i:04d}") if i else ("48", "900000500")  # i=0 repete o OSM "Dupla"
+                phone = ("48", f"9000{1000 + i:04d}") if i else ("48", "900000500")  # i=0 repete o OSM "Dupla"
                 rows.append(FakeBQRow(
                     cnpj_basico=f"99{i:06d}", cnpj_ordem="0001", cnpj_dv="00", nome_fantasia="",
                     razao_social=f"SOCIEDADE DE ADVOGADOS FICTÍCIA {i:02d} LTDA", data_inicio_atividade=datetime(2023 - i % 10, 3, 1).date(),
