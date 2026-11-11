@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import threading
 import time
 from datetime import datetime
@@ -41,6 +40,20 @@ STAGES = {
 }
 
 _lock = threading.RLock()  # reentrante: _upsert é chamado dentro de blocos que já seguram o lock
+# Um lock por telefone: mensagens do MESMO lead são processadas em ordem (sem
+# perder histórico), e leads diferentes não esperam uns pelos outros (antes um
+# lock global segurava todos durante a busca na planilha).
+_phone_locks: dict[str, threading.Lock] = {}
+_phone_locks_guard = threading.Lock()
+
+
+def _phone_lock(phone: str) -> threading.Lock:
+    key = min(phone_variants(phone) or {phone})
+    with _phone_locks_guard:
+        lk = _phone_locks.get(key)
+        if lk is None:  # ~100 bytes por lead; não podamos para não quebrar a exclusão
+            lk = _phone_locks[key] = threading.Lock()
+        return lk
 _evolution = EvolutionClient()
 _sheets = SheetManager()
 _openai_client = None
@@ -141,6 +154,14 @@ def set_paused(phone: str, paused: bool) -> bool:
     return True
 
 
+def _message_id(payload: dict[str, Any]) -> str:
+    data = payload.get("data") or payload
+    if not isinstance(data, dict):
+        return ""
+    key = data.get("key") or {}
+    return str(key.get("id") or data.get("id") or "").strip()
+
+
 def _extract_message_from_payload(payload: dict[str, Any]) -> tuple[str, str]:
     data = payload.get("data") or payload
     key = data.get("key") or {}
@@ -173,6 +194,9 @@ def handle_inbound_payload(
     notify_broker: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     notify_broker = notify_broker or (lambda _msg: None)
+    data = payload.get("data")
+    if data is not None and not isinstance(data, dict):
+        return {"ignored": True, "reason": "payload inválido"}
     phone, text = _extract_message_from_payload(payload)
     if not phone or not text:
         return {"ignored": True, "reason": "sem phone/text"}
@@ -183,15 +207,19 @@ def handle_inbound_payload(
         if not test_phone or not (phone_variants(phone) & phone_variants(test_phone)):
             return {"ignored": True, "reason": "test_mode", "test_phone": test_phone}
 
-    if optout.is_opt_out(text):
-        return _handle_opt_out(phone, text, notify_broker)
+    # Evolution reenvia o webhook se demorarmos a responder: o mesmo id não é processado 2x
+    msg_id = _message_id(payload)
+    if msg_id and not storage.mark_message_seen(msg_id):
+        return {"ignored": True, "reason": "duplicado"}
 
-    if storage.is_blocked(phone):
-        # já pediu para sair: não responder nunca mais
-        return {"ignored": True, "reason": "blocked"}
+    with _phone_lock(phone):
+        if optout.is_opt_out(text):
+            return _handle_opt_out(phone, text, notify_broker)
 
-    # Fix #4: toda a leitura + escrita da conversa dentro do lock para evitar race condition
-    with _lock:
+        if storage.is_blocked(phone):
+            # já pediu para sair: não responder nunca mais
+            return {"ignored": True, "reason": "blocked"}
+
         conv = _get(phone)
         if not conv:
             try:
@@ -212,24 +240,38 @@ def handle_inbound_payload(
                 "last_outbound_ts": None,
             }
 
-        if conv.get("paused_by_broker"):
-            _append_history(conv, "user", text)
-            conv["last_inbound_ts"] = time.time()
-            _upsert(phone, conv)
-
-    if conv.get("paused_by_broker"):
-        notify_broker(f"💬 Lead {conv.get('nome') or phone} respondeu (conversa pausada para humano):\n\n{text}")
-        return {"paused": True}
-
-    with _lock:
         _append_history(conv, "user", text)
         conv["last_inbound_ts"] = time.time()
 
-    decision = _llm_decide(conv, text)
-    result = _apply_decision(conv, decision, notify_broker)
-    with _lock:
+        if conv.get("paused_by_broker"):
+            _upsert(phone, conv)
+            notify_broker(f"💬 Lead {conv.get('nome') or mask_phone(phone)} respondeu (conversa pausada para humano):\n\n{text}")
+            return {"paused": True}
+
+        try:
+            decision = _llm_decide(conv, text)
+        except Exception as exc:
+            # IA fora do ar / timeout: não manda nada errado ao lead, guarda a msg e avisa o corretor
+            _upsert(phone, conv)
+            log.warning("falha na IA ao responder lead", extra={"ctx": {"phone": mask_phone(phone), "error": str(exc)[:200]}})
+            notify_broker(f"⚠️ IA indisponível — lead {conv.get('nome') or mask_phone(phone)} aguardando resposta:\n\n{text}")
+            return {"action": "llm_error"}
+
+        # o corretor pode ter pausado a conversa pelo painel enquanto a IA pensava
+        latest = _get(phone) or {}
+        if latest.get("paused_by_broker"):
+            conv["paused_by_broker"] = True
+            conv["stage"] = latest.get("stage", "HUMAN_TAKEOVER")
+            _upsert(phone, conv)
+            return {"paused": True, "reason": "pausado durante a resposta"}
+
+        result = _apply_decision(conv, decision, notify_broker)
+        latest = _get(phone) or {}
+        if latest.get("paused_by_broker") and not conv.get("paused_by_broker"):
+            conv["paused_by_broker"] = True  # não desfaz pausa feita durante o envio
+            conv["stage"] = "HUMAN_TAKEOVER"
         _upsert(phone, conv)
-    return result
+        return result
 
 
 OPT_OUT_CONFIRMATION = os.getenv(
@@ -320,7 +362,7 @@ def _apply_decision(
 
     if tool == "responder":
         msg = args.get("mensagem", "").strip() or "Pode me contar mais?"
-        new_stage = args.get("novo_estagio") or conv.get("stage", "ENGAGED")
+        new_stage = _valid_stage(args.get("novo_estagio"), conv.get("stage", "ENGAGED"))
         _send_outbound(conv, msg)
         conv["stage"] = new_stage
         _sync_stage(conv)
@@ -332,7 +374,7 @@ def _apply_decision(
         if campo and valor:
             conv.setdefault("collected", {})[campo] = valor
         msg = args.get("mensagem", "").strip()
-        new_stage = args.get("novo_estagio") or conv.get("stage")
+        new_stage = _valid_stage(args.get("novo_estagio"), conv.get("stage", "ENGAGED"))
         if msg:
             _send_outbound(conv, msg)
         conv["stage"] = new_stage
@@ -387,6 +429,16 @@ def _do_schedule(
         _send_outbound(conv, "Não consegui entender a data/horário. Pode escrever no formato dia/mês/ano e hora? Ex: 15/05/2026 às 14h.")
         return {"action": "agendar", "ok": False, "reason": "bad_datetime"}
 
+    if when < datetime.now(TZ):
+        _send_outbound(conv, "Esse horário já passou 🙂 Pode me sugerir outro dia e horário?")
+        conv["stage"] = "COLLECTING_DATETIME"
+        return {"action": "agendar", "ok": False, "reason": "past_datetime"}
+
+    if conv.get("stage") == "SCHEDULED" and conv.get("collected", {}).get("data_hora") == when.isoformat():
+        # IA repetiu o agendamento do mesmo horário: não cria evento duplicado
+        _send_outbound(conv, f"Sua reunião já está confirmada para {when.strftime('%d/%m/%Y às %H:%M')} 👍")
+        return {"action": "agendar", "ok": True, "duplicate": True, "datetime": when.isoformat()}
+
     try:
         from calendar_manager import CalendarManager
 
@@ -438,13 +490,20 @@ def _do_schedule(
     return {"action": "agendar", "ok": True, "datetime": when.isoformat(), "meet_link": meet_link}
 
 
+def _valid_stage(stage: Any, fallback: str) -> str:
+    stage = str(stage or "").strip().upper()
+    return stage if stage in STAGES else (fallback or "ENGAGED")
+
+
 def _sync_stage(conv: dict[str, Any]) -> None:
+    """Só escreve na planilha quando o estágio muda (antes: 1 escrita por mensagem)."""
     sheet = conv.get("sheet")
     row = conv.get("row")
     stage = conv.get("stage")
-    if sheet and row and stage:
+    if sheet and row and stage and conv.get("sheet_stage") != stage:
         try:
             _sheets.update_stage(sheet, row, stage)
+            conv["sheet_stage"] = stage
         except Exception:
             pass
 
