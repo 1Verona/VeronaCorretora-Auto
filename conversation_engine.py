@@ -430,6 +430,8 @@ def _do_schedule(
         return {"action": "agendar", "ok": False, "reason": "bad_datetime"}
 
     if when < datetime.now(TZ):
+        # guarda nome/e-mail já informados para o lead não ter de repetir
+        conv.setdefault("collected", {}).update({"nome_completo": nome_completo, "email": email})
         _send_outbound(conv, "Esse horário já passou 🙂 Pode me sugerir outro dia e horário?")
         conv["stage"] = "COLLECTING_DATETIME"
         return {"action": "agendar", "ok": False, "reason": "past_datetime"}
