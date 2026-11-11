@@ -36,6 +36,7 @@ export default defineConfig({
       '/sheets': backendUrl,
       '/evolution': backendUrl,
       '/webhook': backendUrl,
+      '/blocklist': backendUrl,
     },
   },
 })

@@ -10,3 +10,6 @@ cache/
 tests/
 __pycache__
 *.log
+sim/
+*.patch
+*.zip

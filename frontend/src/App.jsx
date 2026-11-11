@@ -350,7 +350,10 @@ export default function App() {
       return
     }
     loadOutreachStatus()
-    outreachPollRef.current = setInterval(loadOutreachStatus, 5000)
+    // não consulta o backend com a aba do navegador em segundo plano
+    outreachPollRef.current = setInterval(() => {
+      if (!document.hidden) loadOutreachStatus()
+    }, 5000)
     return () => {
       if (outreachPollRef.current) clearInterval(outreachPollRef.current)
     }
