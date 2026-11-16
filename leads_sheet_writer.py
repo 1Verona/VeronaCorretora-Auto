@@ -4,7 +4,7 @@ from typing import Any
 
 
 def ensure_sheet_exists(service, spreadsheet_id: str, sheet_name: str) -> None:
-    metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute(num_retries=4)
     existing = [sheet["properties"]["title"] for sheet in metadata.get("sheets", [])]
     if sheet_name in existing:
         return
@@ -12,7 +12,7 @@ def ensure_sheet_exists(service, spreadsheet_id: str, sheet_name: str) -> None:
     service.spreadsheets().batchUpdate(
         spreadsheetId=spreadsheet_id,
         body={"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]},
-    ).execute()
+    ).execute(num_retries=4)
 
 
 def write_leads_sheet(
@@ -31,7 +31,7 @@ def write_leads_sheet(
     result = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=sheet_name,
-    ).execute()
+    ).execute(num_retries=4)
     existing_values = result.get("values", [])
 
     key_index = headers.index(dedup_key_column)
@@ -42,7 +42,7 @@ def write_leads_sheet(
             range=f"{sheet_name}!A1",
             valueInputOption="RAW",
             body={"values": [headers]},
-        ).execute()
+        ).execute(num_retries=4)
         existing_keys: set[str] = set()
     else:
         existing_headers = existing_values[0]
@@ -65,6 +65,6 @@ def write_leads_sheet(
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": new_rows},
-        ).execute()
+        ).execute(num_retries=4)
 
     return {"added": len(new_rows), "skipped": len(rows) - len(new_rows), "total_input": len(rows)}

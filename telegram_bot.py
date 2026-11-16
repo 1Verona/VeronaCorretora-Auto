@@ -6,9 +6,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import requests
 from dotenv import load_dotenv
@@ -16,9 +14,11 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 from telegram.request import HTTPXRequest
@@ -26,6 +26,10 @@ from telegram.request import HTTPXRequest
 from llm_router import LLMRouter
 from nlp_engine import NLPResult, parse_message
 from sheet_manager import SheetManager
+import storage
+from log_setup import get_logger
+
+log = get_logger("telegram")
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -153,6 +157,15 @@ class ContextStore:
                 self._save()
 
 
+def _parse_ids(raw: str) -> set[int]:
+    out: set[int] = set()
+    for part in (raw or "").replace(";", ",").split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            out.add(int(part))
+    return out
+
+
 class TelegramBot:
     def __init__(self, token: str, flask_url: str = FLASK_BASE_URL) -> None:
         self.token = token
@@ -162,10 +175,60 @@ class TelegramBot:
         self.sheet_manager = SheetManager()
         self.context_store = ContextStore()
         self.llm = LLMRouter()
+        self.api_token_provider = None  # definido pelo app.py (token interno do painel)
+        self._http = requests.Session()
+
+    # ---- controle de acesso ----
+    def allowed_chat_ids(self) -> set[int]:
+        """Quem pode usar o bot. TELEGRAM_ALLOWED_CHAT_IDS (vírgula) tem prioridade.
+        Sem ela, vale o dono gravado (o chat que já usava o bot / o 1º a falar com ele).
+        Antes: QUALQUER pessoa que achasse o bot podia consultar leads e disparar."""
+        env_ids = _parse_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", ""))
+        if env_ids:
+            return env_ids
+        owner = storage.kv_get("telegram_owner_chat")
+        if owner is None:
+            known = list(self.context_store._contexts.keys())
+            if known:
+                owner = known[0]
+                storage.kv_set("telegram_owner_chat", owner)
+        return {int(owner)} if owner is not None else set()
+
+    def is_authorized(self, chat_id: int | None) -> bool:
+        if chat_id is None:
+            return False
+        allowed = self.allowed_chat_ids()
+        if not allowed:
+            # primeiro uso sem lista configurada: este chat vira o dono
+            storage.kv_set("telegram_owner_chat", int(chat_id))
+            log.warning("chat do Telegram registrado como dono (defina TELEGRAM_ALLOWED_CHAT_IDS)", extra={"ctx": {"chat_id": chat_id}})
+            return True
+        return int(chat_id) in allowed
+
+    def broker_chat_id(self) -> int | None:
+        explicit = _parse_ids(os.getenv("TELEGRAM_BROKER_CHAT_ID", ""))
+        if explicit:
+            return next(iter(explicit))
+        allowed = self.allowed_chat_ids()
+        return min(allowed) if allowed else None
+
+    async def _guard(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        if not self.is_authorized(chat.id if chat else None):
+            log.warning("mensagem de chat não autorizado ignorada", extra={"ctx": {"chat_id": chat.id if chat else None}})
+            raise ApplicationHandlerStop
+
+    def _auth_headers(self) -> dict[str, str]:
+        if self.api_token_provider:
+            try:
+                return {"Authorization": f"Bearer {self.api_token_provider()}"}
+            except Exception:
+                return {}
+        return {}
 
     def _api_get(self, path: str) -> dict | None:
         try:
-            resp = requests.get(f"{self.flask_url}{path}", timeout=15)
+            resp = self._http.get(f"{self.flask_url}{path}", headers=self._auth_headers(), timeout=15)
             resp.raise_for_status()
             return resp.json()
         except Exception:
@@ -173,7 +236,7 @@ class TelegramBot:
 
     def _api_post(self, path: str, data: dict | None = None, files: dict | None = None) -> dict | None:
         try:
-            resp = requests.post(f"{self.flask_url}{path}", data=data, files=files, timeout=30)
+            resp = self._http.post(f"{self.flask_url}{path}", data=data, files=files, headers=self._auth_headers(), timeout=30)
             resp.raise_for_status()
             return resp.json()
         except Exception:
@@ -222,7 +285,7 @@ class TelegramBot:
         )
 
         if result.get("updated"):
-            msg = f"✅ *Atualizado!*\n\n"
+            msg = "✅ *Atualizado!*\n\n"
             msg += f"Cliente: *{candidate['nome']}*\n"
             msg += f"Status: {status_label}\n"
             if follow_up:
@@ -566,16 +629,24 @@ class TelegramBot:
     def send_broker_notification(self, text: str) -> None:
         if not self.application or not self._loop:
             return
-        chat_id = next(iter(self.context_store._contexts.keys()), None)
+        # Antes: ia para o 1º chat que já tivesse falado com o bot (podia ser um estranho)
+        chat_id = self.broker_chat_id()
         if not chat_id:
             return
         import asyncio
 
+        async def _send() -> None:
+            try:
+                await self.application.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            except Exception:
+                # texto do lead com _ * [ quebrava o Markdown e o alerta se perdia em silêncio
+                try:
+                    await self.application.bot.send_message(chat_id=chat_id, text=text)
+                except Exception as exc:
+                    log.warning("falha ao enviar alerta no Telegram", extra={"ctx": {"error": str(exc)[:200]}})
+
         try:
-            asyncio.run_coroutine_threadsafe(
-                self.application.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown"),
-                self._loop,
-            )
+            asyncio.run_coroutine_threadsafe(_send(), self._loop)
         except Exception:
             pass
 
@@ -916,13 +987,17 @@ class TelegramBot:
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
 
-        request = HTTPXRequest(httpx_kwargs={"verify": False})
+        # TLS verificado (antes verify=False permitia interceptação). Só desligue
+        # com TELEGRAM_INSECURE_TLS=1 em rede com proxy que reescreve certificados.
+        insecure = os.getenv("TELEGRAM_INSECURE_TLS", "") == "1"
+        request = HTTPXRequest(httpx_kwargs={"verify": False}) if insecure else HTTPXRequest()
         self.application = (
             Application.builder()
             .token(self.token)
             .request(request)
             .build()
         )
+        self.application.add_handler(TypeHandler(Update, self._guard), group=-1)
         self.application.add_handler(CommandHandler("start", self.cmd_start))
         self.application.add_handler(CommandHandler("help", self.cmd_help))
         self.application.add_handler(CommandHandler("status", self.cmd_status))

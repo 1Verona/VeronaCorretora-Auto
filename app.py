@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import hmac as _hmac
 import os
 import re
 import socket
@@ -22,12 +20,8 @@ from lead_gen_worker import load_config as load_leadgen_config, save_config as s
 from outreach_worker import OutreachWorker, load_config, save_config
 from scraper import (
     DEFAULT_CREDENTIALS_PATH,
-    DEFAULT_OUTPUT_SHEET,
-    DEFAULT_SECCIONAL,
-    DEFAULT_SPREADSHEET_ID,
     ScraperConfig,
     allowed_credential_file,
-    apply_priority,
     build_sheets_service,
     cleanup_cache,
     count_leads_per_sheet,
@@ -116,7 +110,10 @@ def _write_env_file(values: dict[str, str]) -> None:
 def _reload_evolution_client() -> None:
     """Recria o EvolutionClient com os valores atuais do os.environ."""
     from evolution_client import EvolutionClient
+    import conversation_engine
+
     outreach_worker.evolution = EvolutionClient()
+    conversation_engine._evolution = EvolutionClient()  # respostas do webhook também usam a nova config
 
 
 def find_free_port(start: int = 5050, max_attempts: int = 10) -> int:
@@ -139,36 +136,53 @@ app = Flask(
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
 
-@app.after_request
-def add_cors(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    return response
-
-
 # ---------------------------------------------------------------------------
-# Auth
+# Segurança: CORS restrito, auth com token que expira, rate limit no /login
 # ---------------------------------------------------------------------------
 
-_ADMIN_USER = os.getenv("ADMIN_USER", "Admin").strip()
-_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
-_APP_SECRET = os.getenv("APP_SECRET", "verona-dev-secret").strip()
+from log_setup import get_logger
+from security import (
+    InsecureConfigError,
+    RateLimiter,
+    TokenService,
+    constant_eq,
+    cors_origins,
+    load_auth_settings,
+    mask_phone,
+)
+import storage
+
+log = get_logger("app")
+
+try:
+    _AUTH = load_auth_settings()
+except InsecureConfigError as _exc:
+    raise SystemExit(f"[SEGURANÇA] Recusando subir: {_exc}. Configure no .env (veja .env.example).")
+
+_ADMIN_USER = _AUTH["user"]
+_ADMIN_PASSWORD = _AUTH["password"]
+_tokens = TokenService(_AUTH["secret"], _AUTH["ttl"])
+_login_limiter = RateLimiter(
+    max_attempts=int(os.getenv("LOGIN_MAX_ATTEMPTS", "5")),
+    window=int(os.getenv("LOGIN_WINDOW_SECONDS", "300")),
+)
 
 _AUTH_SKIP_PREFIXES = ("/webhook/",)
-_AUTH_SKIP_EXACT = {"/login"}
+_AUTH_SKIP_EXACT = {"/login", "/health"}
 
 
-def _make_token(user: str, pw: str) -> str:
-    msg = f"{user}:{pw}".encode()
-    return _hmac.new(_APP_SECRET.encode(), msg, hashlib.sha256).hexdigest()
-
-
-def _verify_token(token: str) -> bool:
-    if not _ADMIN_PASSWORD:
-        return True  # sem senha configurada = acesso livre (dev local)
-    expected = _make_token(_ADMIN_USER, _ADMIN_PASSWORD)
-    return _hmac.compare_digest(token, expected)
+@app.after_request
+def add_cors(response):
+    origin = (request.headers.get("Origin") or "").rstrip("/")
+    allowed = cors_origins()
+    if origin and origin in allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    return response
 
 
 @app.before_request
@@ -178,26 +192,51 @@ def check_auth():
     path = request.path
     if path in _AUTH_SKIP_EXACT or any(path.startswith(p) for p in _AUTH_SKIP_PREFIXES):
         return None
-    if not _ADMIN_PASSWORD:
-        return None  # auth desativada localmente
+    # arquivos estáticos / rotas do SPA não têm dados; toda a API exige token
+    if request.endpoint in ("serve_frontend", "static"):
+        return None
     auth = request.headers.get("Authorization", "")
-    token = ""
-    if auth.lower().startswith("bearer "):
-        token = auth.split(" ", 1)[1].strip()
-    if not token or not _verify_token(token):
+    token = auth.split(" ", 1)[1].strip() if auth.lower().startswith("bearer ") else ""
+    if not token or not _tokens.verify(token):
         return jsonify({"error": "Não autorizado", "auth_required": True}), 401
     return None
 
 
+def _client_ip() -> str:
+    """IP do cliente para rate limit. Só confia em X-Forwarded-For quando a conexão
+    vem do proxy local (Caddy em 127.0.0.1); usa o último salto, que o proxy escreve.
+    Antes: o 1º valor do header (forjável) permitia burlar o limite de tentativas."""
+    import ipaddress
+
+    remote = request.remote_addr or "?"
+    xff = request.headers.get("X-Forwarded-For", "")
+    if not xff:
+        return remote
+    try:
+        ip = ipaddress.ip_address(remote)
+        from_proxy = ip.is_loopback or ip.is_private  # Caddy no host / rede do Docker
+    except ValueError:
+        from_proxy = False
+    if from_proxy or os.getenv("TRUST_PROXY_HEADERS") == "1":
+        return xff.split(",")[-1].strip() or remote
+    return remote
+
+
 @app.post("/login")
 def login():
-    payload = request.get_json(silent=True) or {}
-    user = (payload.get("username") or "").strip()
-    pw = (payload.get("password") or "").strip()
-    if not _ADMIN_PASSWORD:
-        return jsonify({"ok": True, "token": "no-auth"})
-    if user == _ADMIN_USER and pw == _ADMIN_PASSWORD:
-        return jsonify({"ok": True, "token": _make_token(user, pw)})
+    ip = _client_ip()
+    if not _login_limiter.hit(ip):
+        log.warning("login bloqueado por rate limit", extra={"ctx": {"ip": ip}})
+        return jsonify({"ok": False, "error": "Muitas tentativas. Aguarde alguns minutos."}), 429
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        payload = {}
+    user = str(payload.get("username") or "").strip()
+    pw = str(payload.get("password") or "").strip()
+    if constant_eq(user, _ADMIN_USER) and constant_eq(pw, _ADMIN_PASSWORD):
+        _login_limiter.reset(ip)
+        return jsonify({"ok": True, "token": _tokens.issue(user), "expires_in": _tokens.ttl})
+    log.info("login inválido", extra={"ctx": {"ip": ip}})
     return jsonify({"ok": False, "error": "Usuário ou senha incorretos"}), 401
 
 
@@ -288,7 +327,7 @@ class JobManager:
             return stop_event.is_set()
 
         try:
-            summary = run_scrape(config, log_callback=logger, stop_check=stop_check)
+            summary = run_scrape(config, log_callback=logger, stop_check=stop_check, alert_callback=_notify_broker)
             with self._lock:
                 if not self._current_job or self._current_job.get("job_id") != job_id:
                     return
@@ -303,6 +342,7 @@ class JobManager:
                 self._stop_events.pop(job_id, None)
         except Exception as exc:
             logger(f"Falha no job: {exc}")
+            _notify_broker(f"⚠️ Raspagem OAB falhou: {str(exc)[:300]}")
             logger(traceback.format_exc())
             with self._lock:
                 failed_job = self._current_job if self._current_job and self._current_job.get("job_id") == job_id else None
@@ -324,6 +364,8 @@ telegram_bot = TelegramBot(
     token=TELEGRAM_BOT_TOKEN,
     flask_url="http://127.0.0.1:5050",
 )
+# O bot chama a própria API (que agora exige login): token interno de curta duração
+telegram_bot.api_token_provider = lambda: _tokens.issue("telegram-bot")
 
 
 def _notify_broker(text: str) -> None:
@@ -552,13 +594,15 @@ def leadgen_run_now():
 def healthcheck():
     state = job_manager.get_state()
     active = state.get("job")
-    return jsonify(
-        {
-            "ok": True,
-            "credentials_present": CREDENTIALS_PATH.exists(),
-            "job_running": bool(active and active.get("status") == "running"),
-        }
-    )
+    db_ok = storage.ping()
+    body = {
+        "ok": db_ok,
+        "db": db_ok,
+        "credentials_present": CREDENTIALS_PATH.exists(),
+        "job_running": bool(active and active.get("status") == "running"),
+        "outreach_thread_alive": bool(outreach_worker._thread and outreach_worker._thread.is_alive()),
+    }
+    return jsonify(body), (200 if db_ok else 503)
 
 
 @app.get("/outreach/config")
@@ -579,10 +623,33 @@ def outreach_set_config():
         for int_field in ("hour_start", "hour_end", "daily_limit", "min_delay", "max_delay", "max_consecutive_errors"):
             if int_field in merged:
                 merged[int_field] = int(merged[int_field])
+        problem = _validate_outreach_config(merged)
+        if problem:
+            return jsonify({"error": problem}), 400
         saved = save_config(merged)
         return jsonify({"ok": True, "config": saved})
     except (TypeError, ValueError) as exc:
         return jsonify({"error": f"Valor inválido: {exc}"}), 400
+
+
+def _validate_outreach_config(c: dict[str, Any]) -> str:
+    """Barra valores que desligariam as travas de segurança do disparo."""
+    if not (0 <= c.get("hour_start", 9) < c.get("hour_end", 18) <= 24):
+        return "Janela inválida: 0 <= início < fim <= 24"
+    if not (1 <= c.get("daily_limit", 50) <= 1000):
+        return "daily_limit precisa estar entre 1 e 1000"
+    if c.get("min_delay", 60) < 10 or c.get("max_delay", 180) < c.get("min_delay", 60):
+        return "Intervalo inválido: min_delay >= 10s e max_delay >= min_delay"
+    if c.get("max_consecutive_errors", 3) < 1:
+        return "max_consecutive_errors precisa ser >= 1"
+    sched = c.get("warmup_schedule")
+    if sched is not None:
+        try:
+            if not isinstance(sched, list) or any(int(x) <= 0 for x in sched):
+                return "warmup_schedule precisa ser lista de números positivos"
+        except (TypeError, ValueError):
+            return "warmup_schedule precisa ser lista de números positivos"
+    return ""
 
 
 @app.post("/outreach/start")
@@ -590,8 +657,17 @@ def outreach_start():
     config = load_config()
     config["enabled"] = True
     save_config(config)
+    # ligar o disparo de novo = corretor revisou: zera a pausa por erros consecutivos
+    # (antes não havia como zerar; a pausa ficava gravada no banco para sempre)
+    outreach_worker.reset_errors()
     outreach_worker.start()
     return jsonify({"ok": True, "config": config})
+
+
+@app.post("/outreach/reset-errors")
+def outreach_reset_errors():
+    outreach_worker.reset_errors()
+    return jsonify({"ok": True})
 
 
 @app.post("/outreach/stop")
@@ -690,7 +766,8 @@ def sheets_set_config():
 @app.get("/evolution/config")
 def evolution_get_config():
     """Retorna as configura\u00e7\u00f5es atuais da Evolution (mascarando a API key)."""
-    env = _read_env_file()
+    file_env = _read_env_file()
+    env = {k: (file_env.get(k) or os.getenv(k, "")) for k in ("EVOLUTION_API_KEY", "EVOLUTION_API_URL", "EVOLUTION_INSTANCE", "EVOLUTION_WEBHOOK_TOKEN")}
     api_key = env.get("EVOLUTION_API_KEY", "")
     masked_key = (api_key[:6] + "***") if len(api_key) > 6 else ("***" if api_key else "")
     from evolution_client import EvolutionClient
@@ -700,7 +777,7 @@ def evolution_get_config():
         "evolution_api_key_set": bool(api_key),
         "evolution_api_key_masked": masked_key,
         "evolution_instance": env.get("EVOLUTION_INSTANCE", ""),
-        "evolution_webhook_token": env.get("EVOLUTION_WEBHOOK_TOKEN", ""),
+        "evolution_webhook_token": ("***" if env.get("EVOLUTION_WEBHOOK_TOKEN") else ""),
         "configured": client.configured,
     })
 
@@ -712,7 +789,6 @@ def evolution_set_config():
     if not isinstance(payload, dict):
         return jsonify({"error": "Formato inv\u00e1lido"}), 400
 
-    allowed = {"evolution_api_url", "evolution_api_key", "evolution_instance", "evolution_webhook_token"}
     updates: dict[str, str] = {}
 
     if "evolution_api_url" in payload:
@@ -724,11 +800,14 @@ def evolution_set_config():
             updates["EVOLUTION_API_KEY"] = key
     if "evolution_instance" in payload:
         updates["EVOLUTION_INSTANCE"] = str(payload["evolution_instance"]).strip()
-    if "evolution_webhook_token" in payload:
+    if "evolution_webhook_token" in payload and str(payload["evolution_webhook_token"]).strip() not in ("", "***"):
         updates["EVOLUTION_WEBHOOK_TOKEN"] = str(payload["evolution_webhook_token"]).strip()
 
     if not updates:
         return jsonify({"error": "Nenhum campo v\u00e1lido enviado"}), 400
+    if any(("\n" in v or "\r" in v) for v in updates.values()):
+        # evita injetar linhas extras no .env (ex.: trocar ADMIN_PASSWORD)
+        return jsonify({"error": "Valores não podem conter quebra de linha"}), 400
 
     # Salva no .env
     _write_env_file(updates)
@@ -763,31 +842,49 @@ def evolution_qr():
 @app.post("/webhook/evolution/<event>")
 def evolution_webhook(event=None):
     expected_token = os.getenv("EVOLUTION_WEBHOOK_TOKEN", "").strip()
-    if expected_token:
-        auth = request.headers.get("Authorization", "")
-        token_query = request.args.get("token", "")
-        provided = ""
-        if auth.lower().startswith("bearer "):
-            provided = auth.split(" ", 1)[1].strip()
-        elif token_query:
-            provided = token_query.strip()
-        if provided != expected_token:
-            return jsonify({"error": "unauthorized"}), 401
+    if not expected_token:
+        log.error("webhook recusado: EVOLUTION_WEBHOOK_TOKEN não configurado")
+        return jsonify({"error": "webhook desabilitado: configure EVOLUTION_WEBHOOK_TOKEN"}), 503
+    auth = request.headers.get("Authorization", "")
+    provided = ""
+    if auth.lower().startswith("bearer "):
+        provided = auth.split(" ", 1)[1].strip()
+    else:
+        provided = (request.headers.get("X-Webhook-Token") or request.args.get("token") or "").strip()
+    if not constant_eq(provided, expected_token):
+        log.warning("webhook com token inválido", extra={"ctx": {"ip": request.remote_addr}})
+        return jsonify({"error": "unauthorized"}), 401
 
-    payload = request.get_json(silent=True) or {}
-    import json as _json
-    print(f"[WEBHOOK DEBUG] event={event}")
-    print(f"[WEBHOOK DEBUG] payload keys: {list(payload.keys())}")
-    print(f"[WEBHOOK DEBUG] payload (truncated): {_json.dumps(payload, ensure_ascii=False)[:1000]}")
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"ok": True, "result": {"ignored": True, "reason": "payload inválido"}})
     try:
         from conversation_engine import handle_inbound_payload
 
         result = handle_inbound_payload(payload, notify_broker=_notify_broker)
-        print(f"[WEBHOOK DEBUG] result: {result}")
+        # Nunca logar texto da mensagem nem telefone completo (LGPD)
+        log.info("webhook processado", extra={"ctx": {"event": event, "action": (result or {}).get("action") or (result or {}).get("reason")}})
         return jsonify({"ok": True, "result": result})
-    except Exception as exc:
-        traceback.print_exc()
-        return jsonify({"ok": False, "error": str(exc)}), 500
+    except Exception:
+        log.exception("falha ao processar webhook", extra={"ctx": {"event": event}})
+        return jsonify({"ok": False, "error": "erro interno"}), 500
+
+
+@app.get("/blocklist")
+def blocklist_list():
+    return jsonify({"blocked": [{**b, "phone": mask_phone(b["phone"])} for b in storage.list_blocked()]})
+
+
+@app.post("/blocklist")
+def blocklist_add():
+    from evolution_client import normalize_phone
+
+    payload = request.get_json(silent=True) or {}
+    phone = normalize_phone(str(payload.get("phone", "")))
+    if not phone:
+        return jsonify({"error": "telefone inválido"}), 400
+    storage.block(phone, str(payload.get("reason") or "manual"))
+    return jsonify({"ok": True})
 
 
 @app.route("/", defaults={"path": ""})
@@ -801,7 +898,7 @@ def serve_frontend(path):
 
 if __name__ == "__main__":
     cleanup_cache()
-    port = find_free_port(5050)
+    port = find_free_port(int(os.getenv("PORT", "5050")))
     FLASK_PORT_FILE.write_text(str(port))
     telegram_bot.flask_url = f"http://127.0.0.1:{port}"
     print(f" * Backend na porta {port}")

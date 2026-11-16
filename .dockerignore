@@ -1,0 +1,15 @@
+.git
+.venv
+**/node_modules
+frontend/dist
+StartDev.app
+.env
+credentials.json
+data/
+cache/
+tests/
+__pycache__
+*.log
+sim/
+*.patch
+*.zip

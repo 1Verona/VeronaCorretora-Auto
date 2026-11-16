@@ -25,7 +25,7 @@ Três caminhos. Escolha o que combina com o setup atual da sua VM.
    ```
 6. **Mounts / Volumes** (pra preservar estado entre deploys):
    - `/app/credentials.json` → upload o arquivo
-   - `/app/conversations.json` → persistent volume
+   - `/app/data` → persistent volume (SQLite em `DB_PATH`, padrão `/app/data/verona.db`)
    - `/app/outreach_config.json` → persistent volume
    - `/app/bot_contexts.json` → persistent volume
 7. **Domain**: aponte `oabprev.goaether.xyz` pro container, porta 5050. HTTPS automático.
